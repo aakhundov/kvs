@@ -1,0 +1,28 @@
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -misc-no-recursion,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+
+# our own headers only: vendored third-party code is not ours to lint
+HeaderFilterRegex: '.*/kvs/src/.*'
+FormatStyle: file
+
+CheckOptions:
+  # include-cleaner traces a symbol to the header that defines it, and on
+  # Darwin that is an inner header the public one wraps: socklen_t, ssize_t
+  # and struct iovec live under sys/_types, htons in sys/_endian.h, the E*
+  # values in sys/errno.h, sigaction in sys/signal.h, and strdup in _string.h.
+  # Ignoring those five keeps <errno.h>, <signal.h>, <string.h> and the POSIX
+  # headers as the ones to write.
+  # The cost is measured: a missing <errno.h> is no longer reported here, and
+  # is instead 20 compiler errors.
+  misc-include-cleaner.IgnoreHeaders: 'sys/_types/.*;sys/_endian.h;sys/errno.h;sys/signal.h;_string.h'
