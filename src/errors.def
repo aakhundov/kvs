@@ -1,0 +1,7 @@
+X(LINE_TOO_LONG, "line too long")
+X(DISALLOWED_CHARS, "disallowed chars in request")
+X(BAD_REQUEST, "bad request")
+X(SPACE_IN_KEY, "key contains space")
+X(MISSING_KEY, "key is missing")
+X(NO_SPACE_AFTER_KEY, "no space after key")
+X(ALLOCATION, "allocation failed")

@@ -1,10 +1,12 @@
 #include "server.h"
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,6 +16,7 @@
 #include <unistd.h>
 
 #include "debug.h"
+#include "error.h"
 #include "lines.h"
 
 #define LOG_ERROR(function, ...) KVS_LOG(function, __VA_ARGS__)
@@ -23,8 +26,6 @@
 #define LOG_SOCKET(...) KVS_LOG_WITH_ID("socket", socket, __VA_ARGS__)
 #define TRACE_LISTENER(...) KVS_TRACE_WITH_ID("listener", listener, __VA_ARGS__)
 #define TRACE_SOCKET(...) KVS_TRACE_WITH_ID("socket", socket, __VA_ARGS__)
-
-#define KVS_LINE_TOO_LONG_ERROR "ERR: line too long"
 
 static volatile sig_atomic_t interrupted = 0;
 
@@ -151,9 +152,20 @@ static kvs_accept_result_t make_accept(int listener, int *socket, uint16_t *port
   }
 }
 
+static bool has_disallowed_chars(const char *buf, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    for (size_t j = 0; j < sizeof(KVS_DISALLOWED_CHARS) - 1; j++) {
+      if (buf[i] == KVS_DISALLOWED_CHARS[j]) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 static void handle_socket(kvs_server_t *server, int socket, uint16_t port) {
-  char request_buf[KVS_MAX_LINE_LENGTH];
-  char response_buf[KVS_MAX_LINE_LENGTH];
+  char request_buf[KVS_MAX_LINE_LENGTH + 1];  // plus NUL
+  char response_buf[KVS_MAX_LINE_LENGTH + 1]; // plus NUL
 
   (void)port; // used only in LOG_SOCKET
   LOG_SOCKET("opened (port: %d)", port);
@@ -168,34 +180,39 @@ static void handle_socket(kvs_server_t *server, int socket, uint16_t port) {
 
     size_t request_len;
     kvs_read_result_t read_result =
-        kvs_read_line(&stream, request_buf, sizeof(request_buf), &request_len);
+        kvs_read_line(&stream, request_buf, KVS_MAX_LINE_LENGTH, &request_len);
+
+    kvs_error_t error = KVS_ERROR_COUNT;
     if (read_result == KVS_READ_LINE_TOO_LONG) {
-      kvs_write_result_t write_result =
-          kvs_write_line(&stream, KVS_LINE_TOO_LONG_ERROR, strlen(KVS_LINE_TOO_LONG_ERROR));
-      if (write_result != KVS_WRITE_SUCCESS) {
+      error = KVS_ERROR_LINE_TOO_LONG;
+    } else if (read_result != KVS_READ_SUCCESS) {
+      break;
+    } else if (has_disallowed_chars(request_buf, request_len)) {
+      error = KVS_ERROR_DISALLOWED_CHARS;
+    }
+    if (error != KVS_ERROR_COUNT) {
+      const char *error_text = kvs_error_texts[error];
+      if (kvs_write_line(&stream, error_text, strlen(error_text)) != KVS_WRITE_SUCCESS) {
         break;
       }
       continue;
     }
-    if (read_result != KVS_READ_SUCCESS) {
-      break;
-    }
 
-    LOG_SOCKET("request [%.*s]", (int)request_len, request_buf);
+    request_buf[request_len] = '\0';
+    LOG_SOCKET("request [%s]", request_buf);
 
-    size_t response_len;
-    if (!server->handler(server, request_buf, request_len, response_buf, sizeof(response_buf),
-                         &response_len, server->handler_ctx)) {
+    if (!server->handler(server, request_buf, response_buf, server->handler_ctx)) {
       LOG_SOCKET("closed by handler");
       break;
     }
 
+    size_t response_len = strlen(response_buf);
     kvs_write_result_t write_result = kvs_write_line(&stream, response_buf, response_len);
     if (write_result != KVS_WRITE_SUCCESS) {
       break;
     }
 
-    LOG_SOCKET("response [%.*s]", (int)response_len, response_buf);
+    LOG_SOCKET("response [%s]", response_buf);
   }
 
   close(socket);

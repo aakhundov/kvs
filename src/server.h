@@ -9,18 +9,18 @@
 #define KVS_RETRY_DELAY_SECS 10
 #define KVS_MAX_LINE_LENGTH 1024
 
+#define KVS_DISALLOWED_CHARS "\r\0"
+
 typedef struct kvs_server_t kvs_server_t;
 
-// (request) is a string buffer (not NUL-terminated) containing the
-// request line of length (request_len), free of the trailing \r or
-// \n chars. (response) is to be filled with response line (not NUL-
-// terminated), up to (max_response_len) chars. the actual length of
-// the response line must be written into (response_len). return value
-// means request successfully processed: when false is returned, the
-// underlying socket (and connection) are closed.
-typedef bool kvs_server_request_handler_t(const kvs_server_t *server, const char *request,
-                                          size_t request_len, char *response,
-                                          size_t max_response_len, size_t *response_len, void *ctx);
+// (request) is a NUL-terminated string containing the request line,
+// free of the trailing \r or \n chars. (response) is to be filled with
+// response line: a NUL-terminated string up to KVS_MAX_LINE_LENGTH chars,
+// not including the NUL char. return value means request successfully
+// processed: when false is returned, underlying connection is closed.
+// modifying (request) buffer within the C-string bounds is allowed.
+typedef bool kvs_server_request_handler_t(const kvs_server_t *server, char *request, char *response,
+                                          void *ctx);
 
 typedef struct kvs_server_t {
   const char *address;
