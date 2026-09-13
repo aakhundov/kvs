@@ -31,27 +31,22 @@ int main(void) {
   kvs_server_t server;
   kvs_server_init(&server, get_address(), get_port(), handler, &table);
 
-  LOG("starting...");
   if (!kvs_server_start(&server)) {
     LOG("start failed");
     kvs_server_free(&server);
     return 1;
   }
-  LOG("started on %s:%d", server.address, server.port);
+  LOG("listening %s %d", server.address, server.port);
 
-  LOG("running...");
   if (kvs_server_run(&server)) {
-    LOG("run exited");
+    LOG("run stopped");
     ret = 0;
   } else {
     LOG("run failed");
     ret = 1;
   }
 
-  LOG("stopping...");
   kvs_server_stop(&server);
-  LOG("stopped");
-
   kvs_server_free(&server);
   kvs_table_free(&table);
   return ret;

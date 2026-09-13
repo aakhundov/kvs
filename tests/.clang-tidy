@@ -1,0 +1,20 @@
+# Tests inherit the project's checks, minus four. The first three fire inside
+# utest.h's macro expansions rather than in the test code -- every finding of
+# them was traced to the header. The fourth is about the tests themselves: a
+# test is a table of literal inputs and expected outputs, and naming each one
+# would hide what the case actually says.
+InheritParentConfig: true
+
+Checks: >
+  -cert-err33-c,
+  -misc-unused-parameters,
+  -readability-function-cognitive-complexity,
+  -readability-magic-numbers
+
+# our own test headers as well as the sources
+HeaderFilterRegex: '.*/kvs/(src|tests)/.*'
+
+CheckOptions:
+  # the project's list, plus two the harness reaches: poll and its types
+  # sit in sys/poll.h behind <poll.h>, setenv in _stdlib.h behind <stdlib.h>
+  misc-include-cleaner.IgnoreHeaders: 'sys/_types/.*;sys/_endian.h;sys/errno.h;sys/signal.h;_string.h;sys/poll.h;_stdlib.h'
