@@ -1,10 +1,9 @@
-BREW_LLVM := /opt/homebrew/opt/llvm/bin
-LLVM_BIN  := $(if $(wildcard $(BREW_LLVM)/clang),$(BREW_LLVM)/,)
+# make's built-in default for CC is cc; clang unless the command line says otherwise
 ifeq ($(origin CC),default)
-  CC := $(LLVM_BIN)clang
+  CC := clang
 endif
-CLANG_FORMAT := $(LLVM_BIN)clang-format
-CLANG_TIDY   := $(LLVM_BIN)clang-tidy
+CLANG_FORMAT := clang-format
+CLANG_TIDY   := clang-tidy
 
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -14,9 +13,7 @@ CPPFLAGS :=
 LDFLAGS :=
 LDLIBS :=
 
-LEAK_OPT := $(if $(filter $(LLVM_BIN)clang,$(CC)),detect_leaks=1:,)
-RUN_ENV  := ASAN_OPTIONS=$(LEAK_OPT)detect_stack_use_after_return=1 \
-            LSAN_OPTIONS=use_globals=0:use_stacks=0:use_registers=0:use_tls=0
+RUN_ENV := ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1
 
 SRC := $(HERE)src
 TESTS := $(HERE)tests
@@ -35,7 +32,7 @@ TEST_SRCS := $(wildcard $(TESTS)/*.c) $(wildcard $(TESTS)/support/*.c)
 TEST_HDRS := $(wildcard $(TESTS)/support/*.h)
 TEST_OBJS := $(TEST_SRCS:$(TESTS)/%.c=$(BUILD)/tests/%.o)
 TEST_EXEC := $(BUILD)/$(APP)_tests
-TEST_CPPFLAGS := -I$(SRC) -I$(VENDOR)/utest -D_DARWIN_C_SOURCE
+TEST_CPPFLAGS := -I$(SRC) -I$(VENDOR)/utest
 
 LIB_OBJS = $(filter-out $(SERVER_OBJ),$(OBJS))
 
@@ -78,7 +75,6 @@ doctor:
 	@$(CC) --version | head -1
 	@echo "target = `$(CC) -print-target-triple`"
 	@echo "tidy   = $(CLANG_TIDY)"
-	@echo "leaks  = $(if $(LEAK_OPT),on,off)"
 
 clean:
 	rm -rf $(BUILD)

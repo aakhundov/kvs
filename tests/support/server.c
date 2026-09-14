@@ -163,7 +163,7 @@ int kvs_test_server_connect(const kvs_test_server_t *server) {
   }
 
   struct timeval tv = {.tv_sec = KVS_TEST_RECV_TIMEOUT_MS / 1000,
-                       .tv_usec = (KVS_TEST_RECV_TIMEOUT_MS % 1000) * 1000};
+                       .tv_usec = (KVS_TEST_RECV_TIMEOUT_MS % 1000) * 1000L};
   if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0) {
     close(fd);
     return -1;
@@ -172,7 +172,7 @@ int kvs_test_server_connect(const kvs_test_server_t *server) {
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof addr);
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(0x7f000001U); // 127.0.0.1
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons(server->port);
   if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
     close(fd);

@@ -17,12 +17,13 @@ HeaderFilterRegex: '.*/kvs/src/.*'
 FormatStyle: file
 
 CheckOptions:
-  # include-cleaner traces a symbol to the header that defines it, and on
-  # Darwin that is an inner header the public one wraps: socklen_t, ssize_t
-  # and struct iovec live under sys/_types, htons in sys/_endian.h, the E*
-  # values in sys/errno.h, sigaction in sys/signal.h, and strdup in _string.h.
-  # Ignoring those five keeps <errno.h>, <signal.h>, <string.h> and the POSIX
+  # include-cleaner traces a symbol to the header that defines it, and in
+  # glibc that is an inner header the public one wraps: the E* values in
+  # asm-generic and asm, the types under bits, and ssize_t and pid_t
+  # attributed to <sys/types.h> although <unistd.h> and <sys/socket.h>
+  # provide them by POSIX. Ignoring those keeps <errno.h> and the POSIX
   # headers as the ones to write.
   # The cost is measured: a missing <errno.h> is no longer reported here, and
   # is instead 20 compiler errors.
-  misc-include-cleaner.IgnoreHeaders: 'sys/_types/.*;sys/_endian.h;sys/errno.h;sys/signal.h;_string.h'
+  # The regexes are matched against the full path, hence the leading .*/.
+  misc-include-cleaner.IgnoreHeaders: '.*/bits/.*;.*/asm-generic/.*;.*/asm/.*;.*/linux/.*;.*/sys/types.h'

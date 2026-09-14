@@ -2,9 +2,9 @@ Diagnostics:
   MissingIncludes: Strict
   UnusedIncludes: Strict
   Includes:
-    # the .clang-tidy counterpart: on Darwin the defining header is an inner
-    # one the public header wraps, and it is not the include to write
-    IgnoreHeader: [sys/_types/.*, sys/_endian.h, sys/errno.h, sys/signal.h, _string.h, sys/poll.h, _stdlib.h]
+    # the .clang-tidy counterpart: glibc's defining headers are inner ones
+    # the public header wraps, and not the include to write
+    IgnoreHeader: [.*/bits/.*, .*/asm-generic/.*, .*/asm/.*, .*/linux/.*, .*/sys/types.h, .*/sys/poll.h]
 
 InlayHints:
   Enabled: No

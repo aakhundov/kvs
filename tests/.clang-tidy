@@ -15,6 +15,6 @@ Checks: >
 HeaderFilterRegex: '.*/kvs/(src|tests)/.*'
 
 CheckOptions:
-  # the project's list, plus two the harness reaches: poll and its types
-  # sit in sys/poll.h behind <poll.h>, setenv in _stdlib.h behind <stdlib.h>
-  misc-include-cleaner.IgnoreHeaders: 'sys/_types/.*;sys/_endian.h;sys/errno.h;sys/signal.h;_string.h;sys/poll.h;_stdlib.h'
+  # the project's list, plus one the harness reaches: poll and its types
+  # sit in sys/poll.h behind <poll.h>
+  misc-include-cleaner.IgnoreHeaders: '.*/sys/poll.h;.*/bits/.*;.*/asm-generic/.*;.*/asm/.*;.*/linux/.*;.*/sys/types.h'
