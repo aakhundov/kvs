@@ -9,7 +9,6 @@
 -Wstrict-prototypes
 -Wmissing-prototypes
 -Wwrite-strings
--fsanitize=address,undefined
 -D_POSIX_C_SOURCE=200809L
 -Ivendor/utest
 -Isrc

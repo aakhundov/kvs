@@ -7,18 +7,35 @@ CLANG_TIDY   := clang-tidy
 
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-CFLAGS := $(shell cat $(HERE)compile_flags.txt) \
-          -g3 -O0 -fno-omit-frame-pointer -Werror
-CPPFLAGS :=
-LDFLAGS :=
-LDLIBS :=
-
-RUN_ENV := ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1
-
 SRC := $(HERE)src
 TESTS := $(HERE)tests
 VENDOR := $(HERE)vendor
 BUILD := $(HERE)build
+
+ifeq ($(SANITIZER),ASAN)
+  SANITIZER_FLAGS := -fsanitize=address,undefined
+  SANITIZER_ENV := ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1
+  BUILD := $(BUILD)/asan
+else ifeq ($(SANITIZER),TSAN) 
+  SANITIZER_FLAGS := -fsanitize=thread,undefined
+  SANITIZER_ENV := 
+  BUILD := $(BUILD)/tsan
+else
+  ifneq ($(SANITIZER),)
+    $(error bad sanitizer: "$(SANITIZER)")
+  endif
+  # no sanitizer
+  SANITIZER_FLAGS := 
+  SANITIZER_ENV := 
+endif
+
+CFLAGS := $(shell cat $(HERE)compile_flags.txt) \
+          -g3 -O0 -fno-omit-frame-pointer -Werror $(SANITIZER_FLAGS)
+CPPFLAGS :=
+LDFLAGS :=
+LDLIBS :=
+
+RUN_ENV := $(SANITIZER_ENV)
 
 SRCS := $(wildcard $(SRC)/*.c)
 HDRS := $(wildcard $(SRC)/*.h)
@@ -43,7 +60,7 @@ FLAGS_STAMP := $(BUILD)/.flags
 FORMAT_FILES := $(SRCS) $(HDRS) $(TEST_SRCS) $(TEST_HDRS)
 TIDY_FILES := $(SRCS) $(TEST_SRCS)
 
-.PHONY: run test doctor clean format format-check tidy check force
+.PHONY: run run-asan run-tsan test test-asan test-tsan doctor clean format format-check tidy check force
 
 $(SERVER_EXEC): $(LIB_OBJS) $(SERVER_OBJ)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
@@ -67,8 +84,20 @@ $(BUILD):
 run: $(SERVER_EXEC)
 	@$(RUN_ENV) $< $(ARGS)
 
+run-asan:
+	@$(MAKE) run --no-print-directory SANITIZER=ASAN
+
+run-tsan:
+	@$(MAKE) run --no-print-directory SANITIZER=TSAN
+
 test: $(TEST_EXEC) $(SERVER_EXEC)
 	@$(RUN_ENV) KVS_SERVER=$(SERVER_EXEC) $< $(ARGS)
+
+test-asan:
+	@$(MAKE) test --no-print-directory SANITIZER=ASAN
+
+test-tsan:
+	@$(MAKE) test --no-print-directory SANITIZER=TSAN
 
 doctor:
 	@echo "CC     = $(CC)"
@@ -89,6 +118,6 @@ format-check:
 tidy:
 	$(CLANG_TIDY) $(TIDY_FILES) -- $(CFLAGS) $(CPPFLAGS) $(TEST_CPPFLAGS)
 
-check: format-check tidy test
+check: format-check tidy test-asan test-tsan
 
 -include $(DEPS)
