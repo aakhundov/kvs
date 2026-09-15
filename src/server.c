@@ -1,3 +1,7 @@
+// for pthread_setname_np
+#define _GNU_SOURCE // NOLINT(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
+                    // pthread_setname_np
+
 #include "server.h"
 
 #include <assert.h>
@@ -11,6 +15,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -26,6 +31,8 @@
 #define TRACE_LISTENER(...) KVS_TRACE_WITH_ID("listener", listener, __VA_ARGS__)
 #define TRACE_SOCKET(...) KVS_TRACE_WITH_ID("socket", socket, __VA_ARGS__)
 
+#define MAX_THREAD_NAME_LENGTH 16
+
 static volatile sig_atomic_t interrupted = 0;
 
 static void on_interrupt(int sig) {
@@ -33,7 +40,7 @@ static void on_interrupt(int sig) {
   interrupted = 1;
 }
 
-static void setup_signals(void) {
+static inline void setup_signals(void) {
   // disable SIGPIPE handler
   (void)signal(SIGPIPE, SIG_IGN);
 
@@ -45,6 +52,14 @@ static void setup_signals(void) {
   sa.sa_flags = 0; // no SA_RESTART: not resumed
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
+}
+
+static inline void mask_signals(bool mask) {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGINT);
+  sigaddset(&set, SIGTERM);
+  pthread_sigmask(mask ? SIG_BLOCK : SIG_UNBLOCK, &set, NULL);
 }
 
 static int make_listener(const char *address, uint16_t *port) {
@@ -85,7 +100,7 @@ static int make_listener(const char *address, uint16_t *port) {
   }
 
   if (*port == 0) {
-    struct sockaddr_in bound;
+    struct sockaddr_in bound = {0};
     socklen_t len = sizeof bound;
     if (getsockname(listener, (struct sockaddr *)&bound, &len) != 0) {
       LOG_ERRNO("getsockname");
@@ -110,7 +125,7 @@ typedef enum kvs_accept_result_t {
 } kvs_accept_result_t;
 
 static kvs_accept_result_t make_accept(int listener, int *socket, uint16_t *port) {
-  struct sockaddr_in peer;
+  struct sockaddr_in peer = {0};
   socklen_t len = sizeof peer; // out arg
 
   while (true) {
@@ -151,7 +166,7 @@ static kvs_accept_result_t make_accept(int listener, int *socket, uint16_t *port
   }
 }
 
-static bool has_disallowed_chars(const char *buf, size_t n) {
+static inline bool has_disallowed_chars(const char *buf, size_t n) {
   for (size_t i = 0; i < n; i++) {
     for (size_t j = 0; j < sizeof(KVS_DISALLOWED_CHARS) - 1; j++) {
       if (buf[i] == KVS_DISALLOWED_CHARS[j]) {
@@ -162,36 +177,55 @@ static bool has_disallowed_chars(const char *buf, size_t n) {
   return false;
 }
 
-static void handle_socket(kvs_server_t *server, int socket, uint16_t port) {
+static inline kvs_write_result_t write_error(int socket, kvs_error_t error) {
+  kvs_stream_t stream;
+  kvs_stream_init(&stream, socket);
+  const char *error_text = kvs_error_texts[error];
+  return kvs_write_line(&stream, error_text, strlen(error_text));
+}
+
+static void *handle_connection(void *arg) {
+  kvs_connection_t *connection = arg; // owned
+  int socket = connection->socket;
+  uint16_t port = connection->port;
+
   char request_buf[KVS_MAX_LINE_LENGTH + 1];  // plus NUL
   char response_buf[KVS_MAX_LINE_LENGTH + 1]; // plus NUL
 
-  (void)port; // used only in LOG_SOCKET
-  LOG_SOCKET("opened (port: %d)", port);
+  char name[MAX_THREAD_NAME_LENGTH + 1];
+  (void)snprintf(name, MAX_THREAD_NAME_LENGTH, "conn %d (%d)", socket, port);
+  pthread_setname_np(pthread_self(), name); // from _GNU_SOURCE
+
+  LOG_SOCKET("started (port: %d)", port);
 
   kvs_stream_t stream;
   kvs_stream_init(&stream, socket);
 
-  while (true) {
-    if (interrupted) {
-      break;
-    }
+  bool failed = false;
+  size_t num_requests = 0;
 
+  while (true) {
     size_t request_len;
     kvs_read_result_t read_result =
         kvs_read_line(&stream, request_buf, KVS_MAX_LINE_LENGTH, &request_len);
 
-    kvs_error_t error = KVS_ERROR_COUNT;
+    kvs_error_t client_error = KVS_ERROR_COUNT; // sentinel
     if (read_result == KVS_READ_LINE_TOO_LONG) {
-      error = KVS_ERROR_LINE_TOO_LONG;
+      client_error = KVS_ERROR_LINE_TOO_LONG;
     } else if (read_result != KVS_READ_SUCCESS) {
+      if (read_result != KVS_READ_INTERRUPT && read_result != KVS_READ_END_OF_INPUT) {
+        failed = true;
+      }
       break;
     } else if (has_disallowed_chars(request_buf, request_len)) {
-      error = KVS_ERROR_DISALLOWED_CHARS;
+      client_error = KVS_ERROR_DISALLOWED_CHARS;
     }
-    if (error != KVS_ERROR_COUNT) {
-      const char *error_text = kvs_error_texts[error];
-      if (kvs_write_line(&stream, error_text, strlen(error_text)) != KVS_WRITE_SUCCESS) {
+    if (client_error != KVS_ERROR_COUNT) {
+      kvs_write_result_t write_result = write_error(socket, client_error);
+      if (write_result != KVS_WRITE_SUCCESS) {
+        if (write_result != KVS_WRITE_INTERRUPT) {
+          failed = true;
+        }
         break;
       }
       continue;
@@ -200,14 +234,21 @@ static void handle_socket(kvs_server_t *server, int socket, uint16_t port) {
     request_buf[request_len] = '\0';
     LOG_SOCKET("request [%s]", request_buf);
 
-    if (!server->handler(server, request_buf, response_buf, server->handler_ctx)) {
+    if (!connection->handler(connection->server, request_buf, response_buf,
+                             connection->handler_ctx)) {
       LOG_SOCKET("closed by handler");
+      failed = true;
       break;
     }
+
+    num_requests++;
 
     size_t response_len = strlen(response_buf);
     kvs_write_result_t write_result = kvs_write_line(&stream, response_buf, response_len);
     if (write_result != KVS_WRITE_SUCCESS) {
+      if (write_result != KVS_WRITE_INTERRUPT) {
+        failed = true;
+      }
       break;
     }
 
@@ -215,7 +256,46 @@ static void handle_socket(kvs_server_t *server, int socket, uint16_t port) {
   }
 
   close(socket);
-  LOG_SOCKET("closed");
+  free(connection); // free owned
+
+  (void)failed;       // used only in logging
+  (void)num_requests; // used only in logging
+  LOG_SOCKET("%zu requests processed", num_requests);
+  LOG_SOCKET(failed ? "failed" : "stopped");
+
+  return NULL;
+}
+
+static bool make_handler(kvs_server_t *server, int socket, uint16_t port) {
+  kvs_connection_t *connection = malloc(sizeof(*connection));
+  if (connection == NULL) {
+    return false; // allocaiton failed
+  }
+
+  connection->server = server;
+  connection->socket = socket;
+  connection->port = port;
+  connection->handler = server->handler;
+  connection->handler_ctx = server->handler_ctx;
+
+  // temporarily mask signals so that the connection
+  // thread inherits blocked interrupt signal handling
+  mask_signals(true);
+
+  bool ret = true;
+  pthread_t thread;
+  // the connection is owned (and freed) by the thread
+  if (pthread_create(&thread, NULL, handle_connection, connection) != 0) {
+    free(connection); // free, as no thread to free it
+    ret = false;      // thread creation failed
+    goto out;
+  }
+  // the thread is on its own
+  pthread_detach(thread);
+
+out:
+  mask_signals(false); // unmask signals
+  return ret;
 }
 
 void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
@@ -295,7 +375,11 @@ bool kvs_server_run(kvs_server_t *server) {
       return false;
     }
 
-    handle_socket(server, socket, port);
+    if (!make_handler(server, socket, port)) {
+      LOG_LISTENER("failed to make handler for %d", socket);
+      write_error(socket, KVS_ERROR_FAILED_TO_HANDLE);
+      close(socket);
+    }
   }
 
   return true;

@@ -1,10 +1,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include <dirent.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
+#include <sys/wait.h> // NOLINT(misc-include-cleaner): WIFEXITED, WEXITSTATUS
 #include <unistd.h>
 
 #include <utest.h>
@@ -256,13 +258,182 @@ UTEST_F(server, no_request_ends_the_connection) {
   EXPECT_REPLY(fd, "GET a", "NIL");
 }
 
-UTEST_F(server, connections_are_served_one_after_another) {
+// C3: every connection is served on its own thread, so a second client is
+// answered while the first is still connected, an idle client holds up
+// nobody, and requests interleave across connections against one store.
+
+UTEST_F(server, a_second_connection_is_served_while_the_first_stays_open) {
   int second = kvs_test_server_connect(&utest_fixture->server);
   ASSERT_LE(0, second);
   EXPECT_REPLY(utest_fixture->client, "SET a 1", "OK");
-  close(utest_fixture->client);
-  utest_fixture->client = -1;
   EXPECT_REPLY(second, "GET a", "VAL 1");
+  EXPECT_REPLY(utest_fixture->client, "GET a", "VAL 1");
+  close(second);
+}
+
+UTEST_F(server, an_idle_client_holds_up_no_other_client) {
+  // the fixture's client is connected and sends nothing
+  int second = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, second);
+  EXPECT_REPLY(second, "SET a 1", "OK");
+  EXPECT_REPLY(second, "GET a", "VAL 1");
+  EXPECT_REPLY(second, "DEL a", "OK");
+  close(second);
+  EXPECT_REPLY(utest_fixture->client, "GET a", "NIL");
+}
+
+UTEST_F(server, requests_interleave_across_connections_against_one_store) {
+  int a = utest_fixture->client;
+  int b = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, b);
+  EXPECT_REPLY(a, "SET x 1", "OK");
+  EXPECT_REPLY(b, "GET x", "VAL 1");
+  EXPECT_REPLY(b, "SET x 2", "OK");
+  EXPECT_REPLY(a, "GET x", "VAL 2");
+  EXPECT_REPLY(a, "DEL x", "OK");
+  EXPECT_REPLY(b, "GET x", "NIL");
+  EXPECT_REPLY(b, "DEL x", "NIL");
+  close(b);
+}
+
+UTEST_F(server, a_client_that_leaves_does_not_disturb_another_open_connection) {
+  int second = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, second);
+  EXPECT_REPLY(second, "SET a 1", "OK");
+  ASSERT_TRUE(kvs_test_send(second, "SET b", 5)); // leaves mid-request
+  close(second);
+  EXPECT_REPLY(utest_fixture->client, "GET a", "VAL 1");
+  EXPECT_REPLY(utest_fixture->client, "GET b", "NIL");
+}
+
+#define MANY_CONNECTIONS 32
+
+UTEST_F(server, many_connections_open_at_once_are_all_served) {
+  int fds[MANY_CONNECTIONS];
+  for (int i = 0; i < MANY_CONNECTIONS; i++) {
+    fds[i] = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, fds[i]);
+  }
+  char request[32];
+  char expected[32];
+  for (int i = 0; i < MANY_CONNECTIONS; i++) {
+    snprintf(request, sizeof request, "SET key%d %d", i, i);
+    EXPECT_REPLY(fds[i], request, "OK");
+  }
+  for (int i = 0; i < MANY_CONNECTIONS; i++) {
+    // each connection reads a key another connection wrote
+    int j = (i + 1) % MANY_CONNECTIONS;
+    snprintf(request, sizeof request, "GET key%d", j);
+    snprintf(expected, sizeof expected, "VAL %d", j);
+    EXPECT_REPLY(fds[i], request, expected);
+  }
+  for (int i = 0; i < MANY_CONNECTIONS; i++) {
+    close(fds[i]);
+  }
+}
+
+#define BURST_WRITERS 8
+#define BURST_REQUESTS 64
+
+UTEST_F(server, a_burst_of_writers_to_one_key_gets_every_reply_and_one_final_value) {
+  // every writer sends its requests in one write, so the server's threads
+  // run the store operations as concurrently as the suite can make them
+  int fds[BURST_WRITERS];
+  for (int w = 0; w < BURST_WRITERS; w++) {
+    fds[w] = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, fds[w]);
+  }
+  for (int w = 0; w < BURST_WRITERS; w++) {
+    char batch[BURST_REQUESTS * 16];
+    size_t len = 0;
+    for (int r = 0; r < BURST_REQUESTS; r++) {
+      len += (size_t)snprintf(batch + len, sizeof batch - len, "SET hot %d\n", (w * 1000) + r);
+    }
+    ASSERT_TRUE(kvs_test_send(fds[w], batch, len));
+  }
+  for (int w = 0; w < BURST_WRITERS; w++) {
+    for (int r = 0; r < BURST_REQUESTS; r++) {
+      EXPECT_NEXT_LINE(fds[w], "OK");
+    }
+  }
+  // the final value is the last write of one of the writers, whichever it was
+  char reply[REPLY_CAP];
+  ASSERT_TRUE(kvs_test_request(utest_fixture->client, "GET hot", reply, sizeof reply));
+  ASSERT_EQ(0, strncmp("VAL ", reply, 4));
+  int value = (int)strtol(reply + 4, NULL, 10);
+  EXPECT_EQ(BURST_REQUESTS - 1, value % 1000);
+  EXPECT_LT(value / 1000, BURST_WRITERS);
+  for (int w = 0; w < BURST_WRITERS; w++) {
+    close(fds[w]);
+  }
+}
+
+// reads the names of the server's threads from /proc, one per task
+static int read_thread_names(pid_t pid, char names[][32], int cap) {
+  char path[64];
+  snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+  DIR *dir = opendir(path);
+  if (dir == NULL) {
+    return -1;
+  }
+  int n = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL && n < cap) {
+    if (entry->d_name[0] == '.') {
+      continue;
+    }
+    snprintf(path, sizeof path, "/proc/%d/task/%s/comm", (int)pid, entry->d_name);
+    FILE *comm = fopen(path, "r");
+    if (comm == NULL) {
+      continue;
+    }
+    if (fgets(names[n], 32, comm) != NULL) {
+      names[n][strcspn(names[n], "\n")] = '\0';
+      n++;
+    }
+    fclose(comm);
+  }
+  closedir(dir);
+  return n;
+}
+
+UTEST_F(server, every_connection_thread_has_a_distinct_name) {
+  int second = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, second);
+  // a reply proves each connection thread has started and named itself
+  EXPECT_REPLY(utest_fixture->client, "GET a", "NIL");
+  EXPECT_REPLY(second, "GET a", "NIL");
+
+  // the main thread carries the program's name, and so does a sanitizer's
+  // background thread when there is one; the connection threads are the rest
+  char names[8][32];
+  int n = read_thread_names(utest_fixture->server.pid, names, 8);
+  ASSERT_LE(3, n);
+  int connection_threads = 0;
+  const char *first_name = NULL;
+  for (int i = 0; i < n; i++) {
+    if (strcmp(names[i], "kvs") == 0) {
+      continue;
+    }
+    connection_threads++;
+    if (first_name == NULL) {
+      first_name = names[i];
+    } else {
+      EXPECT_STRNE(first_name, names[i]);
+    }
+  }
+  EXPECT_EQ(2, connection_threads);
+  close(second);
+}
+
+UTEST_F(server, a_stop_with_two_clients_connected_ends_both_cleanly) {
+  int second = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, second);
+  EXPECT_REPLY(utest_fixture->client, "SET a 1", "OK");
+  EXPECT_REPLY(second, "GET a", "VAL 1");
+  ASSERT_TRUE(kvs_test_server_stop(&utest_fixture->server));
+  EXPECT_TRUE(kvs_test_recv_eof(utest_fixture->client));
+  EXPECT_TRUE(kvs_test_recv_eof(second));
   close(second);
 }
 

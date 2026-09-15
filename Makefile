@@ -18,7 +18,7 @@ ifeq ($(SANITIZER),ASAN)
   BUILD := $(BUILD)/asan
 else ifeq ($(SANITIZER),TSAN) 
   SANITIZER_FLAGS := -fsanitize=thread,undefined
-  SANITIZER_ENV := 
+  SANITIZER_ENV := TSAN_OPTIONS=atexit_sleep_ms=10
   BUILD := $(BUILD)/tsan
 else
   ifneq ($(SANITIZER),)

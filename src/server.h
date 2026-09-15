@@ -19,6 +19,7 @@ typedef struct kvs_server_t kvs_server_t;
 // not including the NUL char. return value means request successfully
 // processed: when false is returned, underlying connection is closed.
 // modifying (request) buffer within the C-string bounds is allowed.
+// user should make sure (server) still exists before dereferencing it.
 typedef bool kvs_server_request_handler_t(const kvs_server_t *server, char *request, char *response,
                                           void *ctx);
 
@@ -29,6 +30,16 @@ typedef struct kvs_server_t {
   kvs_server_request_handler_t *handler;
   void *handler_ctx;
 } kvs_server_t;
+
+typedef struct kvs_connection_t {
+  // (server) is opaque pointer to pass to the handler:
+  // not to be used as a server instance otherwise
+  void *server;
+  int socket;
+  uint16_t port;
+  kvs_server_request_handler_t *handler;
+  void *handler_ctx;
+} kvs_connection_t;
 
 void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
                      kvs_server_request_handler_t *handler, void *handler_ctx);
