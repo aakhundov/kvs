@@ -22,13 +22,17 @@ static bool handler(const kvs_server_t *server, char *request, char *response, v
 }
 
 int main(void) {
-  int ret = 0;
-
-  kvs_table_t table;
+  static kvs_table_t table;
   kvs_table_init(&table);
 
-  kvs_server_t server;
-  kvs_server_init(&server, get_address(), get_port(), handler, &table);
+  static kvs_server_t server;
+  kvs_server_init(&server, get_address(), get_port(),
+                  (kvs_server_config_t){
+                      .max_connections = get_max_connections(),
+                      .stop_timeout = get_stop_timeout(),
+                      .handler = handler,
+                      .handler_ctx = &table,
+                  });
 
   if (!kvs_server_start(&server)) {
     LOG("start failed");
@@ -37,17 +41,24 @@ int main(void) {
   }
   LOG("listening %s %d", server.address, server.port);
 
+  int ret = 0;
   if (kvs_server_run(&server)) {
-    LOG("run stopped");
-    ret = 0;
+    LOG("run interrupted");
   } else {
     LOG("run failed");
     ret = 1;
   }
 
-  kvs_server_stop(&server);
-  kvs_server_free(&server);
-  kvs_table_free(&table);
+  if (kvs_server_stop(&server)) {
+    LOG("server stopped");
+    // free server and table only if all connection
+    // handler threads were stopped successfully
+    kvs_server_free(&server);
+    kvs_table_free(&table);
+  } else {
+    LOG("stopping failed");
+    ret = 1;
+  }
 
   return ret;
 }

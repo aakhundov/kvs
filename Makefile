@@ -60,7 +60,7 @@ FLAGS_STAMP := $(BUILD)/.flags
 FORMAT_FILES := $(SRCS) $(HDRS) $(TEST_SRCS) $(TEST_HDRS)
 TIDY_FILES := $(SRCS) $(TEST_SRCS)
 
-.PHONY: run run-asan run-tsan test test-asan test-tsan doctor clean format format-check tidy check force
+.PHONY: run run-asan run-tsan test test-asan test-tsan test-all doctor clean format format-check tidy check force
 
 $(SERVER_EXEC): $(LIB_OBJS) $(SERVER_OBJ)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
@@ -99,6 +99,8 @@ test-asan:
 test-tsan:
 	@$(MAKE) test --no-print-directory SANITIZER=TSAN
 
+test-all: test test-asan test-tsan
+
 doctor:
 	@echo "CC     = $(CC)"
 	@$(CC) --version | head -1
@@ -118,6 +120,6 @@ format-check:
 tidy:
 	$(CLANG_TIDY) $(TIDY_FILES) -- $(CFLAGS) $(CPPFLAGS) $(TEST_CPPFLAGS)
 
-check: format-check tidy test-asan test-tsan
+check: format-check tidy test-all
 
 -include $(DEPS)

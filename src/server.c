@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -184,10 +185,48 @@ static inline kvs_write_result_t write_error(int socket, kvs_error_t error) {
   return kvs_write_line(&stream, error_text, strlen(error_text));
 }
 
+static inline void register_socket_locked(kvs_server_t *server, int socket) {
+  assert(socket != -1);
+
+  for (size_t i = 0; i < server->config.max_connections; i++) {
+    if (server->sockets[i] == -1) {
+      server->sockets[i] = socket;
+      return;
+    }
+  }
+
+  // there must have been at least one zero item
+  assert(0 && "unreachable");
+}
+
+static inline void unregister_socket_locked(kvs_server_t *server, int socket) {
+  assert(socket != -1);
+
+  for (size_t i = 0; i < server->config.max_connections; i++) {
+    if (server->sockets[i] == socket) {
+      server->sockets[i] = -1;
+      return;
+    }
+  }
+
+  // socket must have been added before being removed
+  assert(0 && "unreachable");
+}
+
+static inline struct timespec after(uint16_t seconds) {
+  struct timespec result;
+  clock_gettime(CLOCK_REALTIME, &result);
+  result.tv_sec += seconds;
+  return result;
+}
+
 static void *handle_connection(void *arg) {
   kvs_connection_t *connection = arg; // owned
   int socket = connection->socket;
   uint16_t port = connection->port;
+  kvs_server_t *server = connection->server;
+  kvs_server_request_handler_t *request_handler = server->config.handler;
+  void *handler_ctx = server->config.handler_ctx;
 
   char request_buf[KVS_MAX_LINE_LENGTH + 1];  // plus NUL
   char response_buf[KVS_MAX_LINE_LENGTH + 1]; // plus NUL
@@ -234,8 +273,7 @@ static void *handle_connection(void *arg) {
     request_buf[request_len] = '\0';
     LOG_SOCKET("request [%s]", request_buf);
 
-    if (!connection->handler(connection->server, request_buf, response_buf,
-                             connection->handler_ctx)) {
+    if (!request_handler(server, request_buf, response_buf, handler_ctx)) {
       LOG_SOCKET("closed by handler");
       failed = true;
       break;
@@ -263,6 +301,12 @@ static void *handle_connection(void *arg) {
   LOG_SOCKET("%zu requests processed", num_requests);
   LOG_SOCKET(failed ? "failed" : "stopped");
 
+  pthread_mutex_lock(&server->lock);
+  server->num_connections--;
+  unregister_socket_locked(server, socket);
+  pthread_cond_signal(&server->stop_var);
+  pthread_mutex_unlock(&server->lock);
+
   return NULL;
 }
 
@@ -275,8 +319,6 @@ static bool make_handler(kvs_server_t *server, int socket, uint16_t port) {
   connection->server = server;
   connection->socket = socket;
   connection->port = port;
-  connection->handler = server->handler;
-  connection->handler_ctx = server->handler_ctx;
 
   // temporarily mask signals so that the connection
   // thread inherits blocked interrupt signal handling
@@ -298,23 +340,60 @@ out:
   return ret;
 }
 
+static bool stop_handlers(kvs_server_t *server) {
+  bool ret = true;
+  pthread_mutex_lock(&server->lock);
+
+  if (server->num_connections > 0) {
+    for (size_t i = 0; i < server->config.max_connections; i++) {
+      if (server->sockets[i] != -1) {
+        shutdown(server->sockets[i], SHUT_RDWR);
+      }
+    }
+
+    struct timespec deadline = after(server->config.stop_timeout);
+
+    while (server->num_connections > 0) {
+      if (pthread_cond_timedwait(&server->stop_var, &server->lock, &deadline) != 0) {
+        ret = false; // timeout
+        break;
+      }
+    }
+  }
+
+  pthread_mutex_unlock(&server->lock);
+  return ret;
+}
+
 void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
-                     kvs_server_request_handler_t *handler, void *handler_ctx) {
+                     kvs_server_config_t config) {
   assert(server != NULL);
   assert(address != NULL);
-  assert(handler != NULL);
+  assert(config.handler != NULL);
 
   server->address = strdup(address);
   server->port = port;
   server->listener = -1;
-  server->handler = handler;
-  server->handler_ctx = handler_ctx;
+  server->config = config;
+  server->num_connections = 0;
+
+  server->sockets = malloc(server->config.max_connections * sizeof(*server->sockets));
+  for (size_t i = 0; i < server->config.max_connections; i++) {
+    server->sockets[i] = -1;
+  }
+
+  pthread_mutex_init(&server->lock, NULL);
+  pthread_cond_init(&server->stop_var, NULL);
 }
 
 void kvs_server_free(kvs_server_t *server) {
   assert(server != NULL);
 
   free((void *)server->address);
+  free(server->sockets);
+
+  pthread_mutex_destroy(&server->lock);
+  pthread_cond_destroy(&server->stop_var);
 }
 
 bool kvs_server_start(kvs_server_t *server) {
@@ -338,17 +417,27 @@ bool kvs_server_start(kvs_server_t *server) {
   return true;
 }
 
-void kvs_server_stop(kvs_server_t *server) {
+bool kvs_server_stop(kvs_server_t *server) {
   assert(server != NULL);
 
   int listener = server->listener;
   if (listener == -1) {
-    return;
+    return true;
   }
 
   close(listener);
   LOG_LISTENER("stopped");
   server->listener = -1;
+
+  bool ret = true;
+  if (!stop_handlers(server)) {
+    LOG_LISTENER("failed to stop handlers (timeout: %d sec)", server->config.stop_timeout);
+    ret = false;
+  } else {
+    LOG_LISTENER("handlers stopped");
+  }
+
+  return ret;
 }
 
 bool kvs_server_run(kvs_server_t *server) {
@@ -369,13 +458,32 @@ bool kvs_server_run(kvs_server_t *server) {
     uint16_t port;
     kvs_accept_result_t accept_result = make_accept(listener, &socket, &port);
     if (accept_result == KVS_ACCEPT_INTERRUPT) {
-      return true;
+      break;
     }
     if (accept_result != KVS_ACCEPT_SUCCESS) {
       return false;
     }
 
-    if (!make_handler(server, socket, port)) {
+    bool available = true;
+    pthread_mutex_lock(&server->lock);
+    if (server->num_connections < server->config.max_connections) {
+      server->num_connections++;
+      register_socket_locked(server, socket);
+    } else {
+      available = false;
+    }
+    pthread_mutex_unlock(&server->lock);
+
+    if (!available) {
+      LOG_LISTENER("no connection for %d (limit: %d)", socket, server->config.max_connections);
+      write_error(socket, KVS_ERROR_CONNECTION_LIMIT);
+      close(socket);
+    } else if (!make_handler(server, socket, port)) {
+      pthread_mutex_lock(&server->lock);
+      server->num_connections--;
+      unregister_socket_locked(server, socket);
+      pthread_mutex_unlock(&server->lock);
+
       LOG_LISTENER("failed to make handler for %d", socket);
       write_error(socket, KVS_ERROR_FAILED_TO_HANDLE);
       close(socket);

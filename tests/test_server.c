@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <dirent.h>
 #include <sys/socket.h>
@@ -573,6 +574,124 @@ UTEST_F(server, a_stop_while_a_client_is_connected_ends_the_connection_cleanly) 
   EXPECT_REPLY(fd, "SET a 1", "OK");
   ASSERT_TRUE(kvs_test_server_stop(&utest_fixture->server));
   EXPECT_TRUE(kvs_test_recv_eof(fd));
+}
+
+// C5: a stop wakes every connection in flight and waits for it, up to a
+// deadline; at most KVS_MAX_CONNECTIONS connections are served at once, and
+// one beyond that is refused with an error line. The server accepts in
+// order, so a reply on a later connection means every earlier one was
+// admitted.
+
+UTEST_F(server, a_stop_wakes_a_client_that_never_sent_a_request) {
+  // the fixture's client sends nothing
+  int second = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, second);
+  EXPECT_REPLY(second, "GET a", "NIL");
+  // exit status 0 means the count reached zero before the deadline
+  ASSERT_TRUE(kvs_test_server_stop(&utest_fixture->server));
+  EXPECT_TRUE(kvs_test_recv_eof(utest_fixture->client));
+  EXPECT_TRUE(kvs_test_recv_eof(second));
+  EXPECT_TRUE(strstr(utest_fixture->server.said, "server stopped") != NULL);
+  close(second);
+}
+
+struct limited {
+  kvs_test_server_t server;
+};
+
+UTEST_F_SETUP(limited) {
+  if (!kvs_test_server_spawn_with(&utest_fixture->server, "KVS_MAX_CONNECTIONS", "2")) {
+    kvs_test_server_dump(&utest_fixture->server);
+    ASSERT_TRUE(false);
+  }
+}
+
+UTEST_F_TEARDOWN(limited) {
+  bool clean = kvs_test_server_stop(&utest_fixture->server);
+  if (!clean || *utest_result != UTEST_TEST_PASSED) {
+    kvs_test_server_dump(&utest_fixture->server);
+  }
+  EXPECT_TRUE(clean);
+}
+
+UTEST_F(limited, a_connection_beyond_the_limit_gets_an_error_and_end_of_input) {
+  int a = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, a);
+  EXPECT_REPLY(a, "SET x 1", "OK");
+  int b = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, b);
+  EXPECT_REPLY(b, "GET x", "VAL 1");
+
+  int c = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, c);
+  char reply[REPLY_CAP];
+  ASSERT_LE(0, kvs_test_recv_line(c, reply, sizeof reply));
+  EXPECT_EQ(0, strncmp("ERR ", reply, 4));
+  EXPECT_TRUE(kvs_test_recv_eof(c));
+  close(c);
+
+  // the two admitted connections are served as before
+  EXPECT_REPLY(a, "GET x", "VAL 1");
+  EXPECT_REPLY(b, "DEL x", "OK");
+  close(a);
+  close(b);
+}
+
+#define SLOT_ATTEMPTS 200
+#define SLOT_RETRY_NS (10L * 1000L * 1000L)
+
+UTEST_F(limited, a_slot_freed_by_a_client_that_leaves_goes_to_the_next_connection) {
+  int a = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, a);
+  EXPECT_REPLY(a, "SET x 1", "OK");
+  int b = kvs_test_server_connect(&utest_fixture->server);
+  ASSERT_LE(0, b);
+  EXPECT_REPLY(b, "GET x", "VAL 1");
+  close(a);
+
+  // the slot comes back when a's thread has finished, which the suite
+  // cannot observe directly: a refused connection is retried, bounded
+  char reply[REPLY_CAP] = "";
+  bool served = false;
+  for (int i = 0; i < SLOT_ATTEMPTS && !served; i++) {
+    int next = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, next);
+    served = kvs_test_request(next, "GET x", reply, sizeof reply) && strncmp("ERR ", reply, 4) != 0;
+    close(next);
+    if (!served) {
+      struct timespec pause = {0, SLOT_RETRY_NS};
+      nanosleep(&pause, NULL);
+    }
+  }
+  EXPECT_TRUE(served);
+  EXPECT_STREQ("VAL 1", reply);
+  close(b);
+}
+
+// a zero stop timeout: the deadline has passed before any wait begins
+struct impatient {
+  kvs_test_server_t server;
+};
+
+UTEST_F_SETUP(impatient) {
+  if (!kvs_test_server_spawn_with(&utest_fixture->server, "KVS_STOP_TIMEOUT", "0")) {
+    kvs_test_server_dump(&utest_fixture->server);
+    ASSERT_TRUE(false);
+  }
+}
+
+UTEST_F_TEARDOWN(impatient) {
+  // the exit status is each test's to check
+  (void)kvs_test_server_stop(&utest_fixture->server);
+  if (*utest_result != UTEST_TEST_PASSED) {
+    kvs_test_server_dump(&utest_fixture->server);
+  }
+  EXPECT_TRUE(utest_fixture->server.stopped);
+}
+
+UTEST_F(impatient, a_stop_with_nothing_in_flight_does_not_wait_and_exits_zero) {
+  EXPECT_TRUE(kvs_test_server_stop(&utest_fixture->server));
+  EXPECT_TRUE(strstr(utest_fixture->server.said, "server stopped") != NULL);
 }
 
 // no fixture: the server is expected to fail to start

@@ -46,3 +46,12 @@ const char *get_address(void) {
 uint16_t get_port(void) {
   return (uint16_t)get_num_config("KVS_PORT", KVS_DEFAULT_PORT, 0, UINT16_MAX);
 }
+
+uint16_t get_max_connections(void) {
+  return (uint16_t)get_num_config("KVS_MAX_CONNECTIONS", KVS_DEFAULT_MAX_CONNECTIONS, 0,
+                                  UINT16_MAX);
+}
+
+uint16_t get_stop_timeout(void) {
+  return (uint16_t)get_num_config("KVS_STOP_TIMEOUT", KVS_DEFAULT_STOP_TIMEOUT, 0, UINT16_MAX);
+}
