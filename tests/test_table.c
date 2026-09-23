@@ -1,8 +1,11 @@
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <pthread.h>
 
 #include <utest.h>
 
@@ -49,9 +52,10 @@ UTEST_F(table, delete_removes_nothing_from_an_empty_table) {
   EXPECT_FALSE(kvs_table_delete(&utest_fixture->table, "a"));
 }
 
-UTEST_F(table, free_of_an_empty_table_is_fine) {
-  kvs_table_free(&utest_fixture->table);
-  kvs_table_free(&utest_fixture->table);
+UTEST(table, free_of_an_empty_table_is_fine) {
+  kvs_table_t table;
+  kvs_table_init(&table);
+  kvs_table_free(&table);
 }
 
 UTEST_F(table, set_stores_a_value_get_returns_it) {
@@ -214,14 +218,168 @@ UTEST_F(table, growth_after_deletes_keeps_every_live_key) {
   }
 }
 
-UTEST_F(table, free_releases_everything_and_leaves_an_empty_table) {
+// what free releases is checked by LeakSanitizer in the ASan build
+UTEST(table, free_releases_every_entry) {
+  kvs_table_t table;
+  kvs_table_init(&table);
   char key[KEY_SIZE];
   for (int i = 0; i < 100; i++) {
     snprintf(key, sizeof key, "key%d", i);
-    ASSERT_TRUE(kvs_table_set(&utest_fixture->table, key, key));
+    ASSERT_TRUE(kvs_table_set(&table, key, key));
   }
-  kvs_table_free(&utest_fixture->table);
-  EXPECT_ABSENT(&utest_fixture->table, "key0");
-  ASSERT_TRUE(kvs_table_set(&utest_fixture->table, "key0", "again"));
-  EXPECT_STORED(&utest_fixture->table, "key0", "again");
+  kvs_table_free(&table);
+}
+
+// the table's own lock under real threads. each test releases its
+// threads together through a barrier, joins them all, and checks the
+// outcome from the test's thread; the ThreadSanitizer build checks
+// that the lock orders every access the threads made.
+
+#define THREADS 8
+#define KEYS_PER_THREAD 1000
+#define SHARED_KEYS 1000
+
+typedef struct worker_t {
+  kvs_table_t *table;
+  pthread_barrier_t *start;
+  atomic_bool *stop; // for the workers that run until told to stop
+  int id;
+  int found;    // lookups or deletes that found their key
+  int failures; // operations that did not return what the test expects
+} worker_t;
+
+// a test that cannot start its threads cannot run at all
+static void start_worker(pthread_t *thread, worker_t *worker, void *(*fn)(void *)) {
+  if (pthread_create(thread, NULL, fn, worker) != 0) {
+    perror("pthread_create");
+    abort();
+  }
+}
+
+static void *set_own_keys(void *arg) {
+  worker_t *w = arg;
+  char key[KEY_SIZE];
+  pthread_barrier_wait(w->start);
+  for (int i = 0; i < KEYS_PER_THREAD; i++) {
+    snprintf(key, sizeof key, "t%d-key%d", w->id, i);
+    if (!kvs_table_set(w->table, key, key)) {
+      w->failures++;
+    }
+  }
+  return NULL;
+}
+
+static void *delete_shared_keys(void *arg) {
+  worker_t *w = arg;
+  char key[KEY_SIZE];
+  pthread_barrier_wait(w->start);
+  for (int i = 0; i < SHARED_KEYS; i++) {
+    snprintf(key, sizeof key, "key%d", i);
+    if (kvs_table_delete(w->table, key)) {
+      w->found++;
+    }
+  }
+  return NULL;
+}
+
+static void *get_steady_key_until_stopped(void *arg) {
+  worker_t *w = arg;
+  pthread_barrier_wait(w->start);
+  do {
+    const char *value = NULL;
+    if (kvs_table_get(w->table, "steady", &value) && value != NULL && strcmp(value, "yes") == 0) {
+      w->found++;
+    } else {
+      w->failures++;
+    }
+    free((void *)value);
+  } while (!atomic_load(w->stop));
+  return NULL;
+}
+
+UTEST_F(table, threads_setting_distinct_keys_through_growth_lose_none) {
+  pthread_barrier_t start;
+  ASSERT_EQ(0, pthread_barrier_init(&start, NULL, THREADS));
+  pthread_t threads[THREADS];
+  worker_t workers[THREADS];
+  for (int t = 0; t < THREADS; t++) {
+    workers[t] = (worker_t){.table = &utest_fixture->table, .start = &start, .id = t};
+    start_worker(&threads[t], &workers[t], set_own_keys);
+  }
+  for (int t = 0; t < THREADS; t++) {
+    pthread_join(threads[t], NULL);
+  }
+  pthread_barrier_destroy(&start);
+
+  char key[KEY_SIZE];
+  for (int t = 0; t < THREADS; t++) {
+    EXPECT_EQ(0, workers[t].failures);
+    for (int i = 0; i < KEYS_PER_THREAD; i++) {
+      snprintf(key, sizeof key, "t%d-key%d", t, i);
+      EXPECT_STORED(&utest_fixture->table, key, key);
+    }
+  }
+}
+
+UTEST_F(table, threads_deleting_the_same_keys_find_each_key_exactly_once) {
+  char key[KEY_SIZE];
+  for (int i = 0; i < SHARED_KEYS; i++) {
+    snprintf(key, sizeof key, "key%d", i);
+    ASSERT_TRUE(kvs_table_set(&utest_fixture->table, key, "v"));
+  }
+
+  pthread_barrier_t start;
+  ASSERT_EQ(0, pthread_barrier_init(&start, NULL, THREADS));
+  pthread_t threads[THREADS];
+  worker_t workers[THREADS];
+  for (int t = 0; t < THREADS; t++) {
+    workers[t] = (worker_t){.table = &utest_fixture->table, .start = &start, .id = t};
+    start_worker(&threads[t], &workers[t], delete_shared_keys);
+  }
+  for (int t = 0; t < THREADS; t++) {
+    pthread_join(threads[t], NULL);
+  }
+  pthread_barrier_destroy(&start);
+
+  int found = 0;
+  for (int t = 0; t < THREADS; t++) {
+    found += workers[t].found;
+  }
+  EXPECT_EQ(SHARED_KEYS, found);
+  for (int i = 0; i < SHARED_KEYS; i++) {
+    snprintf(key, sizeof key, "key%d", i);
+    EXPECT_ABSENT(&utest_fixture->table, key);
+  }
+}
+
+UTEST_F(table, readers_find_a_present_key_while_writers_grow_the_table) {
+  ASSERT_TRUE(kvs_table_set(&utest_fixture->table, "steady", "yes"));
+
+  // the first half write, the second half read until the writers are done
+  atomic_bool stop = false;
+  pthread_barrier_t start;
+  ASSERT_EQ(0, pthread_barrier_init(&start, NULL, THREADS));
+  pthread_t threads[THREADS];
+  worker_t workers[THREADS];
+  for (int t = 0; t < THREADS; t++) {
+    workers[t] =
+        (worker_t){.table = &utest_fixture->table, .start = &start, .stop = &stop, .id = t};
+    start_worker(&threads[t], &workers[t],
+                 t < THREADS / 2 ? set_own_keys : get_steady_key_until_stopped);
+  }
+  for (int t = 0; t < THREADS / 2; t++) {
+    pthread_join(threads[t], NULL);
+  }
+  atomic_store(&stop, true);
+  for (int t = THREADS / 2; t < THREADS; t++) {
+    pthread_join(threads[t], NULL);
+  }
+  pthread_barrier_destroy(&start);
+
+  for (int t = 0; t < THREADS; t++) {
+    EXPECT_EQ(0, workers[t].failures);
+  }
+  for (int t = THREADS / 2; t < THREADS; t++) {
+    EXPECT_LT(0, workers[t].found);
+  }
 }

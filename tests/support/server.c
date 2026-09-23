@@ -256,6 +256,12 @@ bool kvs_test_recv_eof(int fd) {
 }
 
 bool kvs_test_request(int fd, const char *request, char *reply, size_t cap) {
-  return kvs_test_send(fd, request, strlen(request)) && kvs_test_send(fd, "\n", 1) &&
-         kvs_test_recv_line(fd, reply, cap) >= 0;
+  // one write for the whole line: a separate write for the line feed
+  // waits behind the delayed ack of the first under Nagle's algorithm
+  char line[KVS_TEST_LINE_SIZE];
+  int n = snprintf(line, sizeof line, "%s\n", request);
+  if (n < 0 || (size_t)n >= sizeof line) {
+    return false;
+  }
+  return kvs_test_send(fd, line, (size_t)n) && kvs_test_recv_line(fd, reply, cap) >= 0;
 }

@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <pthread.h>
+
 typedef uint32_t kvs_hash_t;
 
 typedef struct kvs_table_entry_t {
@@ -17,8 +19,17 @@ typedef struct kvs_table_t {
   size_t length;
   size_t capacity;
   kvs_table_entry_t *entries;
+  // the (lock) covers access to the
+  // members above and through them
+  pthread_mutex_t lock;
 } kvs_table_t;
 
+// init / free are table constructor / destructor.
+// calls to all other public API functions are valid
+// only after a call to kvs_table_init and before a
+// subsequent call to kvs_table_free. init / free are
+// not idempotent: calling any of them again, before
+// calling the counterpart, is undefined.
 void kvs_table_init(kvs_table_t *table);
 void kvs_table_free(kvs_table_t *table);
 
@@ -29,7 +40,7 @@ void kvs_table_free(kvs_table_t *table);
 // the client and must be freed by the client. (*value) is
 // set to NULL when returning true if allocating a copy of
 // the value string has failed.
-bool kvs_table_get(const kvs_table_t *table, const char *key, const char **value);
+bool kvs_table_get(kvs_table_t *table, const char *key, const char **value);
 
 // sets the (value) by the (key) in the (table). returns true
 // on success (both for new entry and overwrite), false on failed

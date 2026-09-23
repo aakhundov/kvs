@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pthread.h>
+
 #define INITIAL_CAPACITY 8
 #define NEXT_CAPACITY(prev_capacity)                                                               \
   ((prev_capacity) < INITIAL_CAPACITY ? INITIAL_CAPACITY : (prev_capacity) * 2)
@@ -25,8 +27,8 @@ static inline kvs_hash_t hash_string(const char *chars) {
   return hash;
 }
 
-static inline kvs_table_entry_t *find_entry(kvs_table_entry_t *entries, size_t capacity,
-                                            const char *key, kvs_hash_t hash) {
+static inline kvs_table_entry_t *find_entry_locked(kvs_table_entry_t *entries, size_t capacity,
+                                                   const char *key, kvs_hash_t hash) {
   assert(capacity > 0);
 
   size_t index = hash & (capacity - 1);
@@ -59,7 +61,7 @@ static inline kvs_table_entry_t *find_entry(kvs_table_entry_t *entries, size_t c
   }
 }
 
-static inline bool adjust_capacity(kvs_table_t *t, size_t new_capacity) {
+static inline bool adjust_capacity_locked(kvs_table_t *t, size_t new_capacity) {
   // allocate new storage
   kvs_table_entry_t *new_entries = malloc(new_capacity * sizeof(*new_entries));
   if (new_entries == NULL) {
@@ -77,7 +79,7 @@ static inline bool adjust_capacity(kvs_table_t *t, size_t new_capacity) {
     // copy the non-empty (and non-tombstone) entries from old to storage
     for (kvs_table_entry_t *src = t->entries; src < t->entries + t->capacity; src++) {
       if (src->key != NULL) {
-        kvs_table_entry_t *dst = find_entry(new_entries, new_capacity, src->key, src->hash);
+        kvs_table_entry_t *dst = find_entry_locked(new_entries, new_capacity, src->key, src->hash);
         *dst = *src; // copy the entry
         new_length++;
       }
@@ -97,13 +99,20 @@ static inline bool adjust_capacity(kvs_table_t *t, size_t new_capacity) {
 void kvs_table_init(kvs_table_t *table) {
   assert(table != NULL);
 
+  pthread_mutex_init(&table->lock, NULL);
+  pthread_mutex_lock(&table->lock);
+
   table->length = 0;
   table->capacity = 0;
   table->entries = NULL;
+
+  pthread_mutex_unlock(&table->lock);
 }
 
 void kvs_table_free(kvs_table_t *table) {
   assert(table != NULL);
+
+  pthread_mutex_lock(&table->lock);
 
   if (table->entries != NULL) {
     for (kvs_table_entry_t *e = table->entries; e < table->entries + table->capacity; e++) {
@@ -118,26 +127,38 @@ void kvs_table_free(kvs_table_t *table) {
   table->length = 0;
   table->capacity = 0;
   table->entries = NULL;
+
+  pthread_mutex_unlock(&table->lock);
+  pthread_mutex_destroy(&table->lock);
 }
 
-bool kvs_table_get(const kvs_table_t *table, const char *key, const char **value) {
+bool kvs_table_get(kvs_table_t *table, const char *key, const char **value) {
   assert(table != NULL);
   assert(key != NULL);
   assert(value != NULL);
 
+  kvs_hash_t hash = hash_string(key);
+
+  bool ret = false;
+  pthread_mutex_lock(&table->lock);
+
   if (table->length == 0) {
-    return false;
+    goto out;
   }
 
-  kvs_table_entry_t *entry = find_entry(table->entries, table->capacity, key, hash_string(key));
+  kvs_table_entry_t *entry = find_entry_locked(table->entries, table->capacity, key, hash);
   if (entry->key == NULL) {
-    return false;
+    goto out;
   }
 
   // not owned: moved to client
   *value = strdup(entry->value);
 
-  return true;
+  ret = true;
+
+out:
+  pthread_mutex_unlock(&table->lock);
+  return ret;
 }
 
 bool kvs_table_set(kvs_table_t *table, const char *key, const char *value) {
@@ -145,62 +166,98 @@ bool kvs_table_set(kvs_table_t *table, const char *key, const char *value) {
   assert(key != NULL);
   assert(value != NULL);
 
-  assert(table->length < SIZE_MAX);
-  if (table->length + 1 > MAX_LENGTH(table->capacity)) {
-    size_t new_capacity = NEXT_CAPACITY(table->capacity);
-    if (!adjust_capacity(table, new_capacity)) {
-      return false;
-    }
-  }
-
   kvs_hash_t hash = hash_string(key);
-  kvs_table_entry_t *entry = find_entry(table->entries, table->capacity, key, hash);
 
+  const char *old_value = NULL;
   const char *new_value = strdup(value); // owned
   if (new_value == NULL) {
     return false;
   }
+
+  bool ret = false;
+  pthread_mutex_lock(&table->lock);
+
+  assert(table->length < SIZE_MAX);
+  if (table->length + 1 > MAX_LENGTH(table->capacity)) {
+    size_t new_capacity = NEXT_CAPACITY(table->capacity);
+    if (!adjust_capacity_locked(table, new_capacity)) {
+      free((void *)new_value);
+      goto out;
+    }
+  }
+
+  kvs_table_entry_t *entry = find_entry_locked(table->entries, table->capacity, key, hash);
+
   const char *maybe_new_key = entry->key;
   if (maybe_new_key == NULL) {
     maybe_new_key = strdup(key); // owned
     if (maybe_new_key == NULL) {
       free((void *)new_value);
-      return false;
+      goto out;
     }
     if (entry->value == NULL) {
       // increment only when non-tombstone
       table->length++;
     }
   } else {
-    free((void *)entry->value);
+    old_value = entry->value;
   }
 
   entry->key = maybe_new_key;
   entry->value = new_value;
   entry->hash = hash;
 
-  return true;
+  ret = true;
+
+out:
+  pthread_mutex_unlock(&table->lock);
+
+  if (old_value != NULL) {
+    free((void *)old_value);
+  }
+
+  return ret;
 }
 
 bool kvs_table_delete(kvs_table_t *table, const char *key) {
   assert(table != NULL);
   assert(key != NULL);
 
+  kvs_hash_t hash = hash_string(key);
+
+  const char *old_key = NULL;
+  const char *old_value = NULL;
+
+  bool ret = false;
+  pthread_mutex_lock(&table->lock);
+
   if (table->length == 0) {
-    return false;
+    goto out;
   }
 
-  kvs_table_entry_t *entry = find_entry(table->entries, table->capacity, key, hash_string(key));
+  kvs_table_entry_t *entry = find_entry_locked(table->entries, table->capacity, key, hash);
   if (entry->key == NULL) {
-    return false;
+    goto out;
   }
 
-  free((void *)entry->key);
-  free((void *)entry->value);
+  old_key = entry->key;
+  old_value = entry->value;
 
   // place a tombstone
   entry->key = NULL;
   entry->value = TOMBSTONE;
 
-  return true;
+  ret = true;
+
+out:
+  pthread_mutex_unlock(&table->lock);
+
+  if (old_key != NULL) {
+    free((void *)old_key);
+  }
+  if (old_value != NULL) {
+    free((void *)old_value);
+  }
+
+  return ret;
 }

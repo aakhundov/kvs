@@ -310,13 +310,13 @@ UTEST_F(server, a_client_that_leaves_does_not_disturb_another_open_connection) {
 
 UTEST_F(server, many_connections_open_at_once_are_all_served) {
   int fds[MANY_CONNECTIONS];
-  for (int i = 0; i < MANY_CONNECTIONS; i++) {
-    fds[i] = kvs_test_server_connect(&utest_fixture->server);
-    ASSERT_LE(0, fds[i]);
-  }
   char request[32];
   char expected[32];
   for (int i = 0; i < MANY_CONNECTIONS; i++) {
+    fds[i] = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, fds[i]);
+    // a reply before the next connect means the server has accepted this one,
+    // so the burst never overflows the listen backlog into a 1 s SYN retry
     snprintf(request, sizeof request, "SET key%d %d", i, i);
     EXPECT_REPLY(fds[i], request, "OK");
   }
@@ -365,6 +365,137 @@ UTEST_F(server, a_burst_of_writers_to_one_key_gets_every_reply_and_one_final_val
   EXPECT_LT(value / 1000, BURST_WRITERS);
   for (int w = 0; w < BURST_WRITERS; w++) {
     close(fds[w]);
+  }
+}
+
+// the store's operations under concurrent connections. as in the burst,
+// every connection sends its requests in one write before any reply is
+// read, so the server's threads contend for the store's lock.
+
+#define STORE_CONNECTIONS 8
+#define STORE_KEYS 250
+#define STORE_BATCH_CAP (STORE_KEYS * 32)
+
+UTEST_F(server, concurrent_connections_setting_distinct_keys_through_growth_lose_none) {
+  // 2000 keys against a table that starts at 8 slots: the store grows
+  // several times while the other connections wait on its lock
+  int fds[STORE_CONNECTIONS];
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    fds[c] = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, fds[c]);
+  }
+  char batch[STORE_BATCH_CAP];
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    size_t len = 0;
+    for (int k = 0; k < STORE_KEYS; k++) {
+      len += (size_t)snprintf(batch + len, sizeof batch - len, "SET c%d-k%d %d\n", c, k, k);
+    }
+    ASSERT_TRUE(kvs_test_send(fds[c], batch, len));
+  }
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    for (int k = 0; k < STORE_KEYS; k++) {
+      EXPECT_NEXT_LINE(fds[c], "OK");
+    }
+  }
+  // each connection reads back the keys another connection wrote
+  char expected[32];
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    int owner = (c + 1) % STORE_CONNECTIONS;
+    size_t len = 0;
+    for (int k = 0; k < STORE_KEYS; k++) {
+      len += (size_t)snprintf(batch + len, sizeof batch - len, "GET c%d-k%d\n", owner, k);
+    }
+    ASSERT_TRUE(kvs_test_send(fds[c], batch, len));
+    for (int k = 0; k < STORE_KEYS; k++) {
+      snprintf(expected, sizeof expected, "VAL %d", k);
+      EXPECT_NEXT_LINE(fds[c], expected);
+    }
+  }
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    close(fds[c]);
+  }
+}
+
+UTEST_F(server, concurrent_deletes_of_the_same_keys_find_each_key_exactly_once) {
+  int client = utest_fixture->client;
+  char batch[STORE_BATCH_CAP];
+  size_t len = 0;
+  for (int k = 0; k < STORE_KEYS; k++) {
+    len += (size_t)snprintf(batch + len, sizeof batch - len, "SET k%d v\n", k);
+  }
+  ASSERT_TRUE(kvs_test_send(client, batch, len));
+  for (int k = 0; k < STORE_KEYS; k++) {
+    EXPECT_NEXT_LINE(client, "OK");
+  }
+
+  int fds[STORE_CONNECTIONS];
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    fds[c] = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, fds[c]);
+  }
+  len = 0;
+  for (int k = 0; k < STORE_KEYS; k++) {
+    len += (size_t)snprintf(batch + len, sizeof batch - len, "DEL k%d\n", k);
+  }
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    ASSERT_TRUE(kvs_test_send(fds[c], batch, len));
+  }
+  // every key was present once, so exactly one DEL of it reports OK
+  int found = 0;
+  char reply[REPLY_CAP];
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    for (int k = 0; k < STORE_KEYS; k++) {
+      ASSERT_LE(0, kvs_test_recv_line(fds[c], reply, sizeof reply));
+      if (strcmp("OK", reply) == 0) {
+        found++;
+      } else {
+        EXPECT_STREQ("NIL", reply);
+      }
+    }
+  }
+  EXPECT_EQ(STORE_KEYS, found);
+
+  len = 0;
+  for (int k = 0; k < STORE_KEYS; k++) {
+    len += (size_t)snprintf(batch + len, sizeof batch - len, "GET k%d\n", k);
+  }
+  ASSERT_TRUE(kvs_test_send(client, batch, len));
+  for (int k = 0; k < STORE_KEYS; k++) {
+    EXPECT_NEXT_LINE(client, "NIL");
+  }
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    close(fds[c]);
+  }
+}
+
+UTEST_F(server, gets_find_a_present_key_while_other_connections_grow_the_store) {
+  EXPECT_REPLY(utest_fixture->client, "SET steady yes", "OK");
+
+  // even connections write new keys, odd ones read the steady key
+  int fds[STORE_CONNECTIONS];
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    fds[c] = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, fds[c]);
+  }
+  char batch[STORE_BATCH_CAP];
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    size_t len = 0;
+    for (int k = 0; k < STORE_KEYS; k++) {
+      if (c % 2 == 0) {
+        len += (size_t)snprintf(batch + len, sizeof batch - len, "SET c%d-k%d %d\n", c, k, k);
+      } else {
+        len += (size_t)snprintf(batch + len, sizeof batch - len, "GET steady\n");
+      }
+    }
+    ASSERT_TRUE(kvs_test_send(fds[c], batch, len));
+  }
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    for (int k = 0; k < STORE_KEYS; k++) {
+      EXPECT_NEXT_LINE(fds[c], c % 2 == 0 ? "OK" : "VAL yes");
+    }
+  }
+  for (int c = 0; c < STORE_CONNECTIONS; c++) {
+    close(fds[c]);
   }
 }
 
