@@ -55,5 +55,7 @@ void kvs_server_free(kvs_server_t *server);
 bool kvs_server_start(kvs_server_t *server);
 bool kvs_server_run(kvs_server_t *server);
 bool kvs_server_stop(kvs_server_t *server);
+const char *kvs_server_get_address(const kvs_server_t *server);
+uint16_t kvs_server_get_port(const kvs_server_t *server);
 
 #endif

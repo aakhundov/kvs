@@ -39,7 +39,7 @@ int main(void) {
     kvs_server_free(&server);
     return 1;
   }
-  LOG("listening %s %d", server.address, server.port);
+  LOG("listening %s %d", kvs_server_get_address(&server), kvs_server_get_port(&server));
 
   int ret = 0;
   if (kvs_server_run(&server)) {

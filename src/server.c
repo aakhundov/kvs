@@ -492,3 +492,11 @@ bool kvs_server_run(kvs_server_t *server) {
 
   return true;
 }
+
+const char *kvs_server_get_address(const kvs_server_t *server) {
+  return server->address;
+}
+
+uint16_t kvs_server_get_port(const kvs_server_t *server) {
+  return server->port;
+}
