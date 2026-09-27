@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -189,8 +190,8 @@ static inline void register_socket_locked(kvs_server_t *server, int socket) {
   assert(socket != -1);
 
   for (size_t i = 0; i < server->config.max_connections; i++) {
-    if (server->sockets[i] == -1) {
-      server->sockets[i] = socket;
+    if (server->active_sockets[i] == -1) {
+      server->active_sockets[i] = socket;
       return;
     }
   }
@@ -203,8 +204,8 @@ static inline void unregister_socket_locked(kvs_server_t *server, int socket) {
   assert(socket != -1);
 
   for (size_t i = 0; i < server->config.max_connections; i++) {
-    if (server->sockets[i] == socket) {
-      server->sockets[i] = -1;
+    if (server->active_sockets[i] == socket) {
+      server->active_sockets[i] = -1;
       return;
     }
   }
@@ -237,11 +238,13 @@ static void *handle_connection(void *arg) {
 
   LOG_SOCKET("started (port: %d)", port);
 
+  atomic_fetch_add_explicit(&server->connections_started, 1, memory_order_relaxed);
+
   kvs_stream_t stream;
   kvs_stream_init(&stream, socket);
 
   bool failed = false;
-  size_t num_requests = 0;
+  long num_requests = 0;
 
   while (true) {
     size_t request_len;
@@ -296,13 +299,15 @@ static void *handle_connection(void *arg) {
   close(socket);
   free(connection); // free owned
 
-  (void)failed;       // used only in logging
-  (void)num_requests; // used only in logging
-  LOG_SOCKET("%zu requests processed", num_requests);
+  atomic_fetch_add_explicit(&server->requests_processed, num_requests, memory_order_relaxed);
+  atomic_fetch_add_explicit(&server->connections_finished, 1, memory_order_relaxed);
+
+  (void)failed; // used only in logging
+  LOG_SOCKET("%ld requests processed", num_requests);
   LOG_SOCKET(failed ? "failed" : "stopped");
 
   pthread_mutex_lock(&server->lock);
-  server->num_connections--;
+  server->active_connections--;
   unregister_socket_locked(server, socket);
   pthread_cond_signal(&server->stop_var);
   pthread_mutex_unlock(&server->lock);
@@ -344,16 +349,16 @@ static bool stop_handlers(kvs_server_t *server) {
   bool ret = true;
   pthread_mutex_lock(&server->lock);
 
-  if (server->num_connections > 0) {
+  if (server->active_connections > 0) {
     for (size_t i = 0; i < server->config.max_connections; i++) {
-      if (server->sockets[i] != -1) {
-        shutdown(server->sockets[i], SHUT_RDWR);
+      if (server->active_sockets[i] != -1) {
+        shutdown(server->active_sockets[i], SHUT_RDWR);
       }
     }
 
     struct timespec deadline = after(server->config.stop_timeout);
 
-    while (server->num_connections > 0) {
+    while (server->active_connections > 0) {
       if (pthread_cond_timedwait(&server->stop_var, &server->lock, &deadline) != 0) {
         ret = false; // timeout
         break;
@@ -375,11 +380,16 @@ void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
   server->port = port;
   server->listener = -1;
   server->config = config;
-  server->num_connections = 0;
+  server->active_connections = 0;
 
-  server->sockets = malloc(server->config.max_connections * sizeof(*server->sockets));
+  atomic_init(&server->connections_accepted, 0);
+  atomic_init(&server->connections_started, 0);
+  atomic_init(&server->connections_finished, 0);
+  atomic_init(&server->requests_processed, 0);
+
+  server->active_sockets = malloc(server->config.max_connections * sizeof(*server->active_sockets));
   for (size_t i = 0; i < server->config.max_connections; i++) {
-    server->sockets[i] = -1;
+    server->active_sockets[i] = -1;
   }
 
   pthread_mutex_init(&server->lock, NULL);
@@ -390,7 +400,7 @@ void kvs_server_free(kvs_server_t *server) {
   assert(server != NULL);
 
   free((void *)server->address);
-  free(server->sockets);
+  free(server->active_sockets);
 
   pthread_mutex_destroy(&server->lock);
   pthread_cond_destroy(&server->stop_var);
@@ -434,7 +444,11 @@ bool kvs_server_stop(kvs_server_t *server) {
     LOG_LISTENER("failed to stop handlers (timeout: %d sec)", server->config.stop_timeout);
     ret = false;
   } else {
-    LOG_LISTENER("handlers stopped");
+    LOG_LISTENER("handlers stopped; statistics:");
+    LOG_LISTENER("* connections accepted: %ld", server->connections_accepted);
+    LOG_LISTENER("* connections started: %ld", server->connections_started);
+    LOG_LISTENER("* connections finished: %ld", server->connections_finished);
+    LOG_LISTENER("* requests processed: %ld", server->requests_processed);
   }
 
   return ret;
@@ -464,10 +478,12 @@ bool kvs_server_run(kvs_server_t *server) {
       return false;
     }
 
+    atomic_fetch_add_explicit(&server->connections_accepted, 1, memory_order_relaxed);
+
     bool available = true;
     pthread_mutex_lock(&server->lock);
-    if (server->num_connections < server->config.max_connections) {
-      server->num_connections++;
+    if (server->active_connections < server->config.max_connections) {
+      server->active_connections++;
       register_socket_locked(server, socket);
     } else {
       available = false;
@@ -480,7 +496,7 @@ bool kvs_server_run(kvs_server_t *server) {
       close(socket);
     } else if (!make_handler(server, socket, port)) {
       pthread_mutex_lock(&server->lock);
-      server->num_connections--;
+      server->active_connections--;
       unregister_socket_locked(server, socket);
       pthread_mutex_unlock(&server->lock);
 

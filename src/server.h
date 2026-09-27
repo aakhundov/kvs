@@ -1,6 +1,7 @@
 #ifndef KVS_SERVER_H
 #define KVS_SERVER_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -35,10 +36,14 @@ typedef struct kvs_server_t {
   uint16_t port;
   kvs_server_config_t config;
   int listener;
+  atomic_long connections_accepted;
+  atomic_long connections_started;
+  atomic_long connections_finished;
+  atomic_long requests_processed;
   // access to (and through) the members
   // below is protected by the (lock)
-  int *sockets;
-  size_t num_connections;
+  int *active_sockets;
+  size_t active_connections;
   pthread_cond_t stop_var;
   pthread_mutex_t lock;
 } kvs_server_t;
