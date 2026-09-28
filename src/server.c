@@ -21,9 +21,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "debug.h"
 #include "error.h"
 #include "lines.h"
+#include "logger.h"
 
 #define LOG_ERROR(function, ...) KVS_LOG(function, __VA_ARGS__)
 #define LOG_ERRNO(function) KVS_LOG(function, "%s (%d)", strerror(errno), errno)
@@ -221,6 +221,7 @@ static inline struct timespec after(uint16_t seconds) {
   return result;
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void *handle_connection(void *arg) {
   kvs_connection_t *connection = arg; // owned
   int socket = connection->socket;
@@ -235,6 +236,11 @@ static void *handle_connection(void *arg) {
   char name[MAX_THREAD_NAME_LENGTH + 1];
   (void)snprintf(name, MAX_THREAD_NAME_LENGTH, "conn %d (%d)", socket, port);
   pthread_setname_np(pthread_self(), name); // from _GNU_SOURCE
+
+  // start async logging from connection thread
+  bool async_logging = kvs_logger_async_attach();
+  assert(async_logging);
+  (void)async_logging;
 
   LOG_SOCKET("started (port: %d)", port);
 
@@ -305,6 +311,8 @@ static void *handle_connection(void *arg) {
   (void)failed; // used only in logging
   LOG_SOCKET("%ld requests processed", num_requests);
   LOG_SOCKET(failed ? "failed" : "stopped");
+
+  kvs_logger_async_detach();
 
   pthread_mutex_lock(&server->lock);
   server->active_connections--;

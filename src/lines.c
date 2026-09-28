@@ -9,7 +9,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#include "debug.h"
+#include "logger.h"
 
 #define LOG_READ(...) KVS_LOG_WITH_ID("read", stream->fd, __VA_ARGS__)
 #define LOG_WRITE(...) KVS_LOG_WITH_ID("write", stream->fd, __VA_ARGS__)
