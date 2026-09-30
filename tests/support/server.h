@@ -7,7 +7,7 @@
 
 #include <sys/types.h>
 
-// The spawned-server harness of 1e: kvs runs as a child process with its
+// The spawned-server harness: kvs runs as a child process with its
 // standard error on a pipe, the harness reads that pipe for the listening
 // line, drives the server over real sockets, stops it with SIGTERM and
 // reaps it. Everything the child says after the listening line is kept in

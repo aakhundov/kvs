@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include <dirent.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h> // NOLINT(misc-include-cleaner): WIFEXITED, WEXITSTATUS
 #include <unistd.h>
@@ -16,7 +17,7 @@
 
 #include "support/server.h"
 
-// kvs end to end, as 1e's second process: spawned, driven over a real
+// kvs end to end, as a second process: spawned, driven over a real
 // socket, stopped with SIGTERM and reaped. Each test gets a fresh server;
 // the teardown stops it and requires a clean exit, and prints what the
 // server said only when something failed.
@@ -259,7 +260,7 @@ UTEST_F(server, no_request_ends_the_connection) {
   EXPECT_REPLY(fd, "GET a", "NIL");
 }
 
-// C3: every connection is served on its own thread, so a second client is
+// Every connection is served on its own thread, so a second client is
 // answered while the first is still connected, an idle client holds up
 // nobody, and requests interleave across connections against one store.
 
@@ -576,7 +577,7 @@ UTEST_F(server, a_stop_while_a_client_is_connected_ends_the_connection_cleanly) 
   EXPECT_TRUE(kvs_test_recv_eof(fd));
 }
 
-// C5: a stop wakes every connection in flight and waits for it, up to a
+// A stop wakes every connection in flight and waits for it, up to a
 // deadline; at most KVS_MAX_CONNECTIONS connections are served at once, and
 // one beyond that is refused with an error line. The server accepts in
 // order, so a reply on a later connection means every earlier one was
@@ -666,6 +667,157 @@ UTEST_F(limited, a_slot_freed_by_a_client_that_leaves_goes_to_the_next_connectio
   EXPECT_TRUE(served);
   EXPECT_STREQ("VAL 1", reply);
   close(b);
+}
+
+// Connection threads are joined. A finished thread that nobody joins
+// keeps its stack, so however many connections the server has served, no
+// more finished threads wait to be joined than the limit admits. A stop
+// with finished threads still waiting to be joined ends cleanly; that it
+// joins them shows nowhere a client or the exit status can see.
+
+#define REUSED_CONNECTIONS 40
+#define LEAVING_CLIENTS 4
+#define DEFAULT_STACK_KIB 8192L
+
+// one connection, one request, then the client leaves. A refusal means the
+// previous connection's thread has not finished yet: retried, bounded.
+static bool request_on_new_connection(const kvs_test_server_t *server, const char *request,
+                                      char *reply, size_t cap) {
+  for (int i = 0; i < SLOT_ATTEMPTS; i++) {
+    int fd = kvs_test_server_connect(server);
+    if (fd < 0) {
+      return false;
+    }
+    bool answered = kvs_test_request(fd, request, reply, cap);
+    close(fd);
+    if (answered && strncmp("ERR ", reply, 4) != 0) {
+      return true;
+    }
+    struct timespec pause = {0, SLOT_RETRY_NS};
+    nanosleep(&pause, NULL);
+  }
+  return false;
+}
+
+// the process's virtual size in KiB, from /proc/<pid>/status; -1 on failure
+static long vm_size_kib(pid_t pid) {
+  char path[64];
+  snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
+  FILE *status = fopen(path, "r");
+  if (status == NULL) {
+    return -1;
+  }
+  long kib = -1;
+  char line[256];
+  while (fgets(line, sizeof line, status) != NULL) {
+    if (strncmp(line, "VmSize:", 7) == 0) {
+      kib = strtol(line + 7, NULL, 10);
+      break;
+    }
+  }
+  fclose(status);
+  return kib;
+}
+
+// the stack a new thread gets: RLIMIT_STACK, which the server inherits
+static long thread_stack_kib(void) {
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_STACK, &limit) != 0 || limit.rlim_cur == RLIM_INFINITY) {
+    return DEFAULT_STACK_KIB;
+  }
+  return (long)(limit.rlim_cur / 1024);
+}
+
+// the threads alive in the process, from /proc/<pid>/task; -1 on failure
+static int count_threads(pid_t pid) {
+  char path[64];
+  snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+  DIR *dir = opendir(path);
+  if (dir == NULL) {
+    return -1;
+  }
+  int n = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name[0] != '.') {
+      n++;
+    }
+  }
+  closedir(dir);
+  return n;
+}
+
+UTEST_F(limited, a_slot_is_reused_by_connection_after_connection) {
+  char reply[REPLY_CAP];
+  char request[32];
+  for (int i = 0; i < REUSED_CONNECTIONS; i++) {
+    snprintf(request, sizeof request, "SET n %d", i);
+    ASSERT_TRUE(request_on_new_connection(&utest_fixture->server, request, reply, sizeof reply));
+    EXPECT_STREQ("OK", reply);
+  }
+  char expected[32];
+  snprintf(expected, sizeof expected, "VAL %d", REUSED_CONNECTIONS - 1);
+  ASSERT_TRUE(request_on_new_connection(&utest_fixture->server, "GET n", reply, sizeof reply));
+  EXPECT_STREQ(expected, reply);
+}
+
+UTEST_F(limited, finished_threads_are_joined_so_memory_stays_bounded) {
+  pid_t pid = utest_fixture->server.pid;
+  char reply[REPLY_CAP];
+  // both slots used once: the baseline already holds every stack the limit
+  // allows to wait for a join
+  for (int i = 0; i < 2; i++) {
+    ASSERT_TRUE(request_on_new_connection(&utest_fixture->server, "GET x", reply, sizeof reply));
+  }
+  long before = vm_size_kib(pid);
+  ASSERT_LT(0L, before);
+
+  for (int i = 0; i < REUSED_CONNECTIONS; i++) {
+    ASSERT_TRUE(request_on_new_connection(&utest_fixture->server, "GET x", reply, sizeof reply));
+  }
+  long after = vm_size_kib(pid);
+  ASSERT_LT(0L, after);
+
+  // without the joins every connection would leave a whole stack behind. A
+  // sanitizer's own per-thread state adds a bounded amount on top (about
+  // three stacks' worth under ThreadSanitizer), so the bound is a quarter of
+  // what the unjoined stacks would take
+  EXPECT_LT(after - before, REUSED_CONNECTIONS / 4 * thread_stack_kib());
+}
+
+UTEST_F(server, a_stop_after_clients_have_left_exits_zero) {
+  pid_t pid = utest_fixture->server.pid;
+  // the fixture's client stays connected: its thread is live at the stop
+  EXPECT_REPLY(utest_fixture->client, "GET a", "NIL");
+  int before = count_threads(pid);
+  ASSERT_LT(0, before);
+
+  int fds[LEAVING_CLIENTS];
+  char request[32];
+  for (int i = 0; i < LEAVING_CLIENTS; i++) {
+    fds[i] = kvs_test_server_connect(&utest_fixture->server);
+    ASSERT_LE(0, fds[i]);
+    snprintf(request, sizeof request, "SET key%d %d", i, i);
+    EXPECT_REPLY(fds[i], request, "OK");
+  }
+  for (int i = 0; i < LEAVING_CLIENTS; i++) {
+    close(fds[i]);
+  }
+
+  // the threads end after their clients leave, which only /proc shows;
+  // once they are gone they are finished and not yet joined
+  bool finished = false;
+  for (int i = 0; i < SLOT_ATTEMPTS && !finished; i++) {
+    finished = count_threads(pid) == before;
+    if (!finished) {
+      struct timespec pause = {0, SLOT_RETRY_NS};
+      nanosleep(&pause, NULL);
+    }
+  }
+  ASSERT_TRUE(finished);
+
+  ASSERT_TRUE(kvs_test_server_stop(&utest_fixture->server));
+  EXPECT_TRUE(kvs_test_recv_eof(utest_fixture->client));
 }
 
 // a zero stop timeout: the deadline has passed before any wait begins

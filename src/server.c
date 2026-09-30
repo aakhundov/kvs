@@ -186,34 +186,6 @@ static inline kvs_write_result_t write_error(int socket, kvs_error_t error) {
   return kvs_write_line(&stream, error_text, strlen(error_text));
 }
 
-static inline void register_socket_locked(kvs_server_t *server, int socket) {
-  assert(socket != -1);
-
-  for (size_t i = 0; i < server->config.max_connections; i++) {
-    if (server->active_sockets[i] == -1) {
-      server->active_sockets[i] = socket;
-      return;
-    }
-  }
-
-  // there must have been at least one zero item
-  assert(0 && "unreachable");
-}
-
-static inline void unregister_socket_locked(kvs_server_t *server, int socket) {
-  assert(socket != -1);
-
-  for (size_t i = 0; i < server->config.max_connections; i++) {
-    if (server->active_sockets[i] == socket) {
-      server->active_sockets[i] = -1;
-      return;
-    }
-  }
-
-  // socket must have been added before being removed
-  assert(0 && "unreachable");
-}
-
 static inline struct timespec after(uint16_t seconds) {
   struct timespec result;
   clock_gettime(CLOCK_REALTIME, &result);
@@ -222,11 +194,11 @@ static inline struct timespec after(uint16_t seconds) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static void *handle_connection(void *arg) {
-  kvs_connection_t *connection = arg; // owned
-  int socket = connection->socket;
-  uint16_t port = connection->port;
-  kvs_server_t *server = connection->server;
+static void *connection_handler(void *arg) {
+  kvs_connection_t *conn = arg;
+  int socket = conn->socket;
+  uint16_t port = conn->port;
+  kvs_server_t *server = conn->server;
   kvs_server_request_handler_t *request_handler = server->config.handler;
   void *handler_ctx = server->config.handler_ctx;
 
@@ -242,15 +214,13 @@ static void *handle_connection(void *arg) {
   assert(async_logging);
   (void)async_logging;
 
-  LOG_SOCKET("started (port: %d)", port);
-
-  atomic_fetch_add_explicit(&server->connections_started, 1, memory_order_relaxed);
+  LOG_SOCKET("connection started (port: %d)", port);
 
   kvs_stream_t stream;
   kvs_stream_init(&stream, socket);
 
   bool failed = false;
-  long num_requests = 0;
+  size_t num_requests = 0;
 
   while (true) {
     size_t request_len;
@@ -303,79 +273,114 @@ static void *handle_connection(void *arg) {
   }
 
   close(socket);
-  free(connection); // free owned
 
-  atomic_fetch_add_explicit(&server->requests_processed, num_requests, memory_order_relaxed);
-  atomic_fetch_add_explicit(&server->connections_finished, 1, memory_order_relaxed);
+  conn->failed = failed;
+  conn->num_requests = num_requests;
 
-  (void)failed; // used only in logging
   LOG_SOCKET("%ld requests processed", num_requests);
-  LOG_SOCKET(failed ? "failed" : "stopped");
+  LOG_SOCKET("connection %s", failed ? "failed" : "finished");
 
   kvs_logger_async_detach();
 
+  atomic_store_explicit(&conn->active, false, memory_order_relaxed);
+
   pthread_mutex_lock(&server->lock);
-  server->active_connections--;
-  unregister_socket_locked(server, socket);
+  server->num_active_connections--;
   pthread_cond_signal(&server->stop_var);
   pthread_mutex_unlock(&server->lock);
 
   return NULL;
 }
 
-static bool make_handler(kvs_server_t *server, int socket, uint16_t port) {
-  kvs_connection_t *connection = malloc(sizeof(*connection));
-  if (connection == NULL) {
-    return false; // allocaiton failed
+static inline kvs_connection_t *get_available_connection(kvs_server_t *server) {
+  for (kvs_connection_t *conn = server->connections;
+       conn < server->connections + server->config.max_connections; conn++) {
+    if (!atomic_load_explicit(&conn->active, memory_order_relaxed)) {
+      return conn;
+    }
   }
 
-  connection->server = server;
-  connection->socket = socket;
-  connection->port = port;
+  return NULL;
+}
+
+static inline void finalize_handler(kvs_server_t *server, kvs_connection_t *conn) {
+  pthread_join(conn->thread, NULL);
+
+  server->counters.connections_finished++;
+  server->counters.requests_processed += conn->num_requests;
+  if (conn->failed) {
+    server->counters.connections_failed++;
+  }
+}
+
+static bool make_handler(kvs_server_t *server, kvs_connection_t *conn, int socket, uint16_t port) {
+  if (conn->assigned) {
+    finalize_handler(server, conn);
+    conn->assigned = false;
+  }
+
+  conn->server = server;
+  conn->socket = socket;
+  conn->port = port;
 
   // temporarily mask signals so that the connection
   // thread inherits blocked interrupt signal handling
   mask_signals(true);
 
-  bool ret = true;
   pthread_t thread;
-  // the connection is owned (and freed) by the thread
-  if (pthread_create(&thread, NULL, handle_connection, connection) != 0) {
-    free(connection); // free, as no thread to free it
-    ret = false;      // thread creation failed
+  bool thread_created = true;
+  atomic_store_explicit(&conn->active, true, memory_order_relaxed);
+  if (pthread_create(&thread, NULL, connection_handler, conn) != 0) {
+    atomic_store_explicit(&conn->active, false, memory_order_relaxed);
+    thread_created = false;
     goto out;
   }
-  // the thread is on its own
-  pthread_detach(thread);
+
+  conn->thread = thread;
+  conn->assigned = true;
+
+  server->counters.connections_started++;
 
 out:
   mask_signals(false); // unmask signals
-  return ret;
+  return thread_created;
 }
 
 static bool stop_handlers(kvs_server_t *server) {
-  bool ret = true;
+  bool threads_stopped = true;
   pthread_mutex_lock(&server->lock);
 
-  if (server->active_connections > 0) {
-    for (size_t i = 0; i < server->config.max_connections; i++) {
-      if (server->active_sockets[i] != -1) {
-        shutdown(server->active_sockets[i], SHUT_RDWR);
+  if (server->num_active_connections > 0) {
+    for (kvs_connection_t *conn = server->connections;
+         conn < server->connections + server->config.max_connections; conn++) {
+      if (atomic_load_explicit(&conn->active, memory_order_relaxed)) {
+        shutdown(conn->socket, SHUT_RDWR);
       }
     }
 
     struct timespec deadline = after(server->config.stop_timeout);
 
-    while (server->active_connections > 0) {
+    while (server->num_active_connections > 0) {
       if (pthread_cond_timedwait(&server->stop_var, &server->lock, &deadline) != 0) {
-        ret = false; // timeout
+        threads_stopped = false; // timeout
         break;
       }
     }
   }
 
   pthread_mutex_unlock(&server->lock);
-  return ret;
+
+  if (threads_stopped) {
+    for (kvs_connection_t *conn = server->connections;
+         conn < server->connections + server->config.max_connections; conn++) {
+      if (conn->assigned) {
+        finalize_handler(server, conn);
+        conn->assigned = false;
+      }
+    }
+  }
+
+  return threads_stopped;
 }
 
 void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
@@ -388,27 +393,47 @@ void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
   server->port = port;
   server->listener = -1;
   server->config = config;
-  server->active_connections = 0;
+  server->num_active_connections = 0;
+  server->counters = (kvs_statistics_t){0};
 
-  atomic_init(&server->connections_accepted, 0);
-  atomic_init(&server->connections_started, 0);
-  atomic_init(&server->connections_finished, 0);
-  atomic_init(&server->requests_processed, 0);
-
-  server->active_sockets = malloc(server->config.max_connections * sizeof(*server->active_sockets));
-  for (size_t i = 0; i < server->config.max_connections; i++) {
-    server->active_sockets[i] = -1;
+  server->connections = malloc(server->config.max_connections * sizeof(*server->connections));
+  for (kvs_connection_t *conn = server->connections;
+       conn < server->connections + server->config.max_connections; conn++) {
+    atomic_init(&conn->active, false);
+    conn->assigned = false;
   }
 
   pthread_mutex_init(&server->lock, NULL);
   pthread_cond_init(&server->stop_var, NULL);
 }
 
+static inline void log_statistics(kvs_server_t *server, bool partial) {
+  int listener = server->listener;
+  (void)listener;
+
+  LOG_LISTENER("server statistics (%s):", partial ? "partial" : "complete");
+
+  if (partial) {
+    pthread_mutex_lock(&server->lock);
+    size_t connections_pending = server->num_active_connections;
+    pthread_mutex_unlock(&server->lock);
+
+    LOG_LISTENER("* connections pending: %zu", connections_pending);
+    (void)connections_pending;
+  }
+
+  LOG_LISTENER("* connections accepted: %zu", server->counters.connections_accepted);
+  LOG_LISTENER("* connections started: %zu", server->counters.connections_started);
+  LOG_LISTENER("* connections finished: %zu", server->counters.connections_finished);
+  LOG_LISTENER("* connections failed: %zu", server->counters.connections_failed);
+  LOG_LISTENER("* requests processed: %zu", server->counters.requests_processed);
+}
+
 void kvs_server_free(kvs_server_t *server) {
   assert(server != NULL);
 
   free((void *)server->address);
-  free(server->active_sockets);
+  free(server->connections);
 
   pthread_mutex_destroy(&server->lock);
   pthread_cond_destroy(&server->stop_var);
@@ -427,7 +452,7 @@ bool kvs_server_start(kvs_server_t *server) {
   if (listener == -1) {
     return false;
   }
-  LOG_LISTENER("started (port: %d)", server->port);
+  LOG_LISTENER("listener started (port: %d)", server->port);
 
   setup_signals();
 
@@ -440,26 +465,25 @@ bool kvs_server_stop(kvs_server_t *server) {
 
   int listener = server->listener;
   if (listener == -1) {
+    LOG_LISTENER("server already stopped");
     return true;
   }
 
   close(listener);
-  LOG_LISTENER("stopped");
-  server->listener = -1;
+  LOG_LISTENER("listener stopped");
 
-  bool ret = true;
+  bool handlers_stopped = true;
   if (!stop_handlers(server)) {
     LOG_LISTENER("failed to stop handlers (timeout: %d sec)", server->config.stop_timeout);
-    ret = false;
+    handlers_stopped = false;
   } else {
-    LOG_LISTENER("handlers stopped; statistics:");
-    LOG_LISTENER("* connections accepted: %ld", server->connections_accepted);
-    LOG_LISTENER("* connections started: %ld", server->connections_started);
-    LOG_LISTENER("* connections finished: %ld", server->connections_finished);
-    LOG_LISTENER("* requests processed: %ld", server->requests_processed);
+    LOG_LISTENER("handlers stopped");
   }
 
-  return ret;
+  log_statistics(server, !handlers_stopped);
+  server->listener = -1;
+
+  return handlers_stopped;
 }
 
 bool kvs_server_run(kvs_server_t *server) {
@@ -486,30 +510,32 @@ bool kvs_server_run(kvs_server_t *server) {
       return false;
     }
 
-    atomic_fetch_add_explicit(&server->connections_accepted, 1, memory_order_relaxed);
+    server->counters.connections_accepted++;
 
-    bool available = true;
+    bool available = false;
     pthread_mutex_lock(&server->lock);
-    if (server->active_connections < server->config.max_connections) {
-      server->active_connections++;
-      register_socket_locked(server, socket);
-    } else {
-      available = false;
+    if (server->num_active_connections < server->config.max_connections) {
+      server->num_active_connections++;
+      available = true;
     }
     pthread_mutex_unlock(&server->lock);
 
-    if (!available) {
+    if (available) {
+      kvs_connection_t *conn = get_available_connection(server);
+      assert(conn != NULL); // connection must be available
+
+      if (!make_handler(server, conn, socket, port)) {
+        pthread_mutex_lock(&server->lock);
+        server->num_active_connections--;
+        pthread_mutex_unlock(&server->lock);
+
+        LOG_LISTENER("failed to make handler for %d", socket);
+        write_error(socket, KVS_ERROR_FAILED_TO_HANDLE);
+        close(socket);
+      }
+    } else {
       LOG_LISTENER("no connection for %d (limit: %d)", socket, server->config.max_connections);
       write_error(socket, KVS_ERROR_CONNECTION_LIMIT);
-      close(socket);
-    } else if (!make_handler(server, socket, port)) {
-      pthread_mutex_lock(&server->lock);
-      server->active_connections--;
-      unregister_socket_locked(server, socket);
-      pthread_mutex_unlock(&server->lock);
-
-      LOG_LISTENER("failed to make handler for %d", socket);
-      write_error(socket, KVS_ERROR_FAILED_TO_HANDLE);
       close(socket);
     }
   }

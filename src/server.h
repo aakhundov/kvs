@@ -31,28 +31,38 @@ typedef struct kvs_server_config_t {
   void *handler_ctx;
 } kvs_server_config_t;
 
+typedef struct kvs_connection_t {
+  bool assigned;
+  atomic_bool active;
+  pthread_t thread;
+  kvs_server_t *server;
+  int socket;
+  uint16_t port;
+  size_t num_requests;
+  bool failed;
+} kvs_connection_t;
+
+typedef struct kvs_statistics_t {
+  size_t connections_accepted;
+  size_t connections_started;
+  size_t connections_finished;
+  size_t connections_failed;
+  size_t requests_processed;
+} kvs_statistics_t;
+
 typedef struct kvs_server_t {
   const char *address;
   uint16_t port;
   kvs_server_config_t config;
   int listener;
-  atomic_long connections_accepted;
-  atomic_long connections_started;
-  atomic_long connections_finished;
-  atomic_long requests_processed;
-  // access to (and through) the members
-  // below is protected by the (lock)
-  int *active_sockets;
-  size_t active_connections;
+  kvs_statistics_t counters;
+  kvs_connection_t *connections;
+  // access to the members below
+  // is protected by the (lock)
+  size_t num_active_connections;
   pthread_cond_t stop_var;
   pthread_mutex_t lock;
 } kvs_server_t;
-
-typedef struct kvs_connection_t {
-  kvs_server_t *server;
-  int socket;
-  uint16_t port;
-} kvs_connection_t;
 
 void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
                      kvs_server_config_t config);
