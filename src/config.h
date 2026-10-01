@@ -7,10 +7,12 @@
 #define KVS_DEFAULT_PORT 7777
 #define KVS_DEFAULT_MAX_CONNECTIONS 256
 #define KVS_DEFAULT_STOP_TIMEOUT 10 // seconds
+#define KVS_DEFAULT_STRESS_SEED 0
 
 const char *get_address(void);
 uint16_t get_port(void);
 uint16_t get_max_connections(void);
 uint16_t get_stop_timeout(void);
+unsigned long get_stress_seed(void);
 
 #endif

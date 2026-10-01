@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "debug.h"
 #include "error.h"
 #include "lines.h"
 #include "logger.h"
@@ -34,6 +35,7 @@
 #define TRACE_SOCKET(...) KVS_TRACE_WITH_ID("socket", socket, __VA_ARGS__)
 
 #define MAX_THREAD_NAME_LENGTH 16
+#define MAIN_THREAD_STREAM 1000
 
 static volatile sig_atomic_t interrupted = 0;
 
@@ -126,11 +128,12 @@ typedef enum kvs_accept_result_t {
   KVS_ACCEPT_DEFECT,
 } kvs_accept_result_t;
 
-static kvs_accept_result_t make_accept(int listener, int *socket, uint16_t *port) {
+static kvs_accept_result_t accept_connection(int listener, int *socket, uint16_t *port) {
   struct sockaddr_in peer = {0};
   socklen_t len = sizeof peer; // out arg
 
   while (true) {
+    SCHED_POINT();
     if (interrupted) {
       LOG_LISTENER("interrupted");
       return KVS_ACCEPT_INTERRUPT;
@@ -183,6 +186,7 @@ static inline kvs_write_result_t write_error(int socket, kvs_error_t error) {
   kvs_stream_t stream;
   kvs_stream_init(&stream, socket);
   const char *error_text = kvs_error_texts[error];
+  SCHED_POINT();
   return kvs_write_line(&stream, error_text, strlen(error_text));
 }
 
@@ -209,6 +213,9 @@ static void *connection_handler(void *arg) {
   (void)snprintf(name, MAX_THREAD_NAME_LENGTH, "conn %d (%d)", socket, port);
   pthread_setname_np(pthread_self(), name); // from _GNU_SOURCE
 
+  SET_THREAD_STREAM(conn->stream);
+
+  SCHED_POINT();
   // start async logging from connection thread
   bool async_logging = kvs_logger_async_attach();
   assert(async_logging);
@@ -224,8 +231,10 @@ static void *connection_handler(void *arg) {
 
   while (true) {
     size_t request_len;
+    SCHED_POINT();
     kvs_read_result_t read_result =
         kvs_read_line(&stream, request_buf, KVS_MAX_LINE_LENGTH, &request_len);
+    SCHED_POINT();
 
     kvs_error_t client_error = KVS_ERROR_COUNT; // sentinel
     if (read_result == KVS_READ_LINE_TOO_LONG) {
@@ -261,6 +270,7 @@ static void *connection_handler(void *arg) {
     num_requests++;
 
     size_t response_len = strlen(response_buf);
+    SCHED_POINT();
     kvs_write_result_t write_result = kvs_write_line(&stream, response_buf, response_len);
     if (write_result != KVS_WRITE_SUCCESS) {
       if (write_result != KVS_WRITE_INTERRUPT) {
@@ -272,6 +282,7 @@ static void *connection_handler(void *arg) {
     LOG_SOCKET("response [%s]", response_buf);
   }
 
+  SCHED_POINT();
   close(socket);
 
   conn->failed = failed;
@@ -280,14 +291,18 @@ static void *connection_handler(void *arg) {
   LOG_SOCKET("%ld requests processed", num_requests);
   LOG_SOCKET("connection %s", failed ? "failed" : "finished");
 
+  SCHED_POINT();
   kvs_logger_async_detach();
+  SCHED_POINT();
 
   atomic_store_explicit(&conn->active, false, memory_order_relaxed);
 
+  SCHED_POINT();
   pthread_mutex_lock(&server->lock);
   server->num_active_connections--;
   pthread_cond_signal(&server->stop_var);
   pthread_mutex_unlock(&server->lock);
+  SCHED_POINT();
 
   return NULL;
 }
@@ -304,6 +319,7 @@ static inline kvs_connection_t *get_available_connection(kvs_server_t *server) {
 }
 
 static inline void finalize_handler(kvs_server_t *server, kvs_connection_t *conn) {
+  SCHED_POINT();
   pthread_join(conn->thread, NULL);
 
   server->counters.connections_finished++;
@@ -323,6 +339,9 @@ static bool make_handler(kvs_server_t *server, kvs_connection_t *conn, int socke
   conn->socket = socket;
   conn->port = port;
 
+  // connection thread's stream is set based on the # of accepted connections
+  conn->stream = MAIN_THREAD_STREAM + server->counters.connections_accepted;
+
   // temporarily mask signals so that the connection
   // thread inherits blocked interrupt signal handling
   mask_signals(true);
@@ -335,6 +354,7 @@ static bool make_handler(kvs_server_t *server, kvs_connection_t *conn, int socke
     thread_created = false;
     goto out;
   }
+  SCHED_POINT();
 
   conn->thread = thread;
   conn->assigned = true;
@@ -348,6 +368,7 @@ out:
 
 static bool stop_handlers(kvs_server_t *server) {
   bool threads_stopped = true;
+  SCHED_POINT();
   pthread_mutex_lock(&server->lock);
 
   if (server->num_active_connections > 0) {
@@ -383,11 +404,37 @@ static bool stop_handlers(kvs_server_t *server) {
   return threads_stopped;
 }
 
+static inline void log_statistics(kvs_server_t *server, bool partial) {
+  int listener = server->listener;
+  (void)listener;
+
+  LOG_LISTENER("server statistics (%s):", partial ? "partial" : "complete");
+
+  if (partial) {
+    SCHED_POINT();
+    pthread_mutex_lock(&server->lock);
+    size_t connections_pending = server->num_active_connections;
+    pthread_mutex_unlock(&server->lock);
+    SCHED_POINT();
+
+    LOG_LISTENER("* connections pending: %zu", connections_pending);
+    (void)connections_pending;
+  }
+
+  LOG_LISTENER("* connections accepted: %zu", server->counters.connections_accepted);
+  LOG_LISTENER("* connections started: %zu", server->counters.connections_started);
+  LOG_LISTENER("* connections finished: %zu", server->counters.connections_finished);
+  LOG_LISTENER("* connections failed: %zu", server->counters.connections_failed);
+  LOG_LISTENER("* requests processed: %zu", server->counters.requests_processed);
+}
+
 void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
                      kvs_server_config_t config) {
   assert(server != NULL);
   assert(address != NULL);
   assert(config.handler != NULL);
+
+  SET_THREAD_STREAM(MAIN_THREAD_STREAM);
 
   server->address = strdup(address);
   server->port = port;
@@ -405,28 +452,6 @@ void kvs_server_init(kvs_server_t *server, const char *address, uint16_t port,
 
   pthread_mutex_init(&server->lock, NULL);
   pthread_cond_init(&server->stop_var, NULL);
-}
-
-static inline void log_statistics(kvs_server_t *server, bool partial) {
-  int listener = server->listener;
-  (void)listener;
-
-  LOG_LISTENER("server statistics (%s):", partial ? "partial" : "complete");
-
-  if (partial) {
-    pthread_mutex_lock(&server->lock);
-    size_t connections_pending = server->num_active_connections;
-    pthread_mutex_unlock(&server->lock);
-
-    LOG_LISTENER("* connections pending: %zu", connections_pending);
-    (void)connections_pending;
-  }
-
-  LOG_LISTENER("* connections accepted: %zu", server->counters.connections_accepted);
-  LOG_LISTENER("* connections started: %zu", server->counters.connections_started);
-  LOG_LISTENER("* connections finished: %zu", server->counters.connections_finished);
-  LOG_LISTENER("* connections failed: %zu", server->counters.connections_failed);
-  LOG_LISTENER("* requests processed: %zu", server->counters.requests_processed);
 }
 
 void kvs_server_free(kvs_server_t *server) {
@@ -502,7 +527,7 @@ bool kvs_server_run(kvs_server_t *server) {
 
     int socket;
     uint16_t port;
-    kvs_accept_result_t accept_result = make_accept(listener, &socket, &port);
+    kvs_accept_result_t accept_result = accept_connection(listener, &socket, &port);
     if (accept_result == KVS_ACCEPT_INTERRUPT) {
       break;
     }
@@ -513,12 +538,14 @@ bool kvs_server_run(kvs_server_t *server) {
     server->counters.connections_accepted++;
 
     bool available = false;
+    SCHED_POINT();
     pthread_mutex_lock(&server->lock);
     if (server->num_active_connections < server->config.max_connections) {
       server->num_active_connections++;
       available = true;
     }
     pthread_mutex_unlock(&server->lock);
+    SCHED_POINT();
 
     if (available) {
       kvs_connection_t *conn = get_available_connection(server);

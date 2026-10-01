@@ -1,5 +1,5 @@
-#ifndef KVS_DEBUG_H
-#define KVS_DEBUG_H
+#ifndef KVS_LOGGER_H
+#define KVS_LOGGER_H
 
 #include <limits.h>
 #include <stdbool.h>

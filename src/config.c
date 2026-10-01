@@ -1,6 +1,7 @@
 #include "config.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -54,4 +55,8 @@ uint16_t get_max_connections(void) {
 
 uint16_t get_stop_timeout(void) {
   return (uint16_t)get_num_config("KVS_STOP_TIMEOUT", KVS_DEFAULT_STOP_TIMEOUT, 0, UINT16_MAX);
+}
+
+unsigned long get_stress_seed(void) {
+  return get_num_config("KVS_STRESS_SEED", KVS_DEFAULT_STRESS_SEED, 0, ULONG_MAX);
 }

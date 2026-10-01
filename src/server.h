@@ -40,6 +40,7 @@ typedef struct kvs_connection_t {
   uint16_t port;
   size_t num_requests;
   bool failed;
+  unsigned long stream;
 } kvs_connection_t;
 
 typedef struct kvs_statistics_t {
